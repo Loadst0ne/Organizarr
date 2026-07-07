@@ -28,12 +28,190 @@ use tokio::time::sleep;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The state of a torrent as reported by the qBittorrent WebUI API in the
+/// `state` field of `torrents/info`. Covers both qBittorrent 5.x
+/// (`stoppedUP`/`stoppedDL`) and 4.x (`pausedUP`/`pausedDL`) spellings.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TorrentState {
+    // Error states
+    #[serde(rename = "error")]
+    Error,
+    #[serde(rename = "missingFiles")]
+    MissingFiles,
+    // Download finished (upload-side) states
+    #[serde(rename = "uploading")]
+    Uploading,
+    #[serde(rename = "stoppedUP", alias = "pausedUP")]
+    StoppedUpload,
+    #[serde(rename = "queuedUP")]
+    QueuedUpload,
+    #[serde(rename = "stalledUP")]
+    StalledUpload,
+    #[serde(rename = "checkingUP")]
+    CheckingUpload,
+    #[serde(rename = "forcedUP")]
+    ForcedUpload,
+    // Download in progress states
+    #[serde(rename = "allocating")]
+    Allocating,
+    #[serde(rename = "downloading")]
+    Downloading,
+    #[serde(rename = "metaDL")]
+    FetchingMetadata,
+    #[serde(rename = "forcedMetaDL")]
+    ForcedFetchingMetadata,
+    #[serde(rename = "stoppedDL", alias = "pausedDL")]
+    StoppedDownload,
+    #[serde(rename = "queuedDL")]
+    QueuedDownload,
+    #[serde(rename = "stalledDL")]
+    StalledDownload,
+    #[serde(rename = "checkingDL")]
+    CheckingDownload,
+    #[serde(rename = "forcedDL")]
+    ForcedDownload,
+    // Transitional / other states
+    #[serde(rename = "checkingResumeData")]
+    CheckingResumeData,
+    #[serde(rename = "moving")]
+    Moving,
+    #[serde(other)]
+    #[default]
+    Unknown,
+}
+
+impl TorrentState {
+    /// True when the torrent's download has finished (the payload on disk
+    /// is complete), regardless of what it is doing now.
+    pub fn download_finished(&self) -> bool {
+        matches!(
+            self,
+            Self::Uploading
+                | Self::StoppedUpload
+                | Self::QueuedUpload
+                | Self::StalledUpload
+                | Self::CheckingUpload
+                | Self::ForcedUpload
+                | Self::Moving
+        )
+    }
+
+    /// True when it is safe for this tool to move the torrent's files:
+    /// the download is finished AND qBittorrent is not actively using the
+    /// payload for something that a concurrent move would corrupt.
+    ///
+    /// Deliberately excluded even though the download is finished:
+    /// - `Moving`: qBittorrent is relocating the files itself; racing it
+    ///   would corrupt or lose data.
+    /// - `CheckingUpload`: the payload is being re-verified, with files
+    ///   held open for hashing.
+    /// - `Error`/`MissingFiles`: something is wrong; acting on inconsistent
+    ///   state risks destroying data.
+    pub fn safe_to_move(&self) -> bool {
+        matches!(
+            self,
+            Self::Uploading
+                | Self::StoppedUpload
+                | Self::QueuedUpload
+                | Self::StalledUpload
+                | Self::ForcedUpload
+        )
+    }
+
+    /// True for states that indicate something is wrong with the torrent.
+    pub fn is_errored(&self) -> bool {
+        matches!(self, Self::Error | Self::MissingFiles)
+    }
+
+    /// Human-readable description used in logs.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Self::Error => "errored",
+            Self::MissingFiles => "errored (missing files)",
+            Self::Uploading => "seeding",
+            Self::StoppedUpload => "completed (stopped)",
+            Self::QueuedUpload => "completed (queued for seeding)",
+            Self::StalledUpload => "seeding (stalled)",
+            Self::CheckingUpload => "completed (checking)",
+            Self::ForcedUpload => "seeding (forced)",
+            Self::Allocating => "allocating space",
+            Self::Downloading => "downloading",
+            Self::FetchingMetadata => "fetching metadata",
+            Self::ForcedFetchingMetadata => "fetching metadata (forced)",
+            Self::StoppedDownload => "stopped (incomplete)",
+            Self::QueuedDownload => "queued for download",
+            Self::StalledDownload => "downloading (stalled)",
+            Self::CheckingDownload => "checking (incomplete)",
+            Self::ForcedDownload => "downloading (forced)",
+            Self::CheckingResumeData => "checking resume data",
+            Self::Moving => "being moved by qBittorrent",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for TorrentState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.describe())
+    }
+}
+
+/// Remembers each torrent's last observed state for one server, so that
+/// state transitions can be detected and logged across polling cycles.
+#[derive(Debug, Default, Clone)]
+pub struct StateTracker {
+    states: std::collections::HashMap<String, TorrentState>,
+}
+
+impl StateTracker {
+    /// Records the states observed this cycle, logging every transition
+    /// (and newly finished downloads in particular). Torrents that are no
+    /// longer reported (e.g. removed after a move) are forgotten.
+    pub fn observe(&mut self, torrents: &[Torrent]) {
+        let mut seen = std::collections::HashMap::with_capacity(torrents.len());
+        for torrent in torrents {
+            seen.insert(torrent.hash.clone(), torrent.state);
+            match self.states.get(&torrent.hash) {
+                Some(previous) if *previous != torrent.state => {
+                    if torrent.state.is_errored() {
+                        warn!(
+                            "Torrent '{}' changed state: {} -> {}",
+                            torrent.name, previous, torrent.state
+                        );
+                    } else if !previous.download_finished() && torrent.state.download_finished() {
+                        info!(
+                            "Torrent '{}' finished downloading ({} -> {})",
+                            torrent.name, previous, torrent.state
+                        );
+                    } else {
+                        info!(
+                            "Torrent '{}' changed state: {} -> {}",
+                            torrent.name, previous, torrent.state
+                        );
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    if torrent.state.is_errored() {
+                        warn!("Torrent '{}' is in state: {}", torrent.name, torrent.state);
+                    }
+                }
+            }
+        }
+        self.states = seen;
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Torrent {
     pub save_path: String,
     pub name: String,
     pub category: String,
     pub hash: String,
+    /// Current state as reported by qBittorrent. Defaults to `Unknown`
+    /// (treated as unsafe to act on) if the field is absent.
+    #[serde(default)]
+    pub state: TorrentState,
     /// Absolute path of the torrent's content on the qBittorrent host
     /// (root path for multi-file torrents, file path for single-file ones).
     /// Available since qBittorrent 4.2; preferred over `save_path` + `name`
@@ -128,10 +306,11 @@ impl TorrentClient {
         Ok(())
     }
 
-    pub async fn get_completed_torrents(&self) -> Result<Vec<Torrent>> {
-        let response = self
-            .get("/api/v2/torrents/info", &[("filter", "completed")])
-            .await?;
+    /// Fetches all torrents with their current states. The full list (not
+    /// just completed torrents) is needed so state transitions such as
+    /// downloading -> seeding can be observed.
+    pub async fn get_torrents(&self) -> Result<Vec<Torrent>> {
+        let response = self.get("/api/v2/torrents/info", &[]).await?;
         let torrents = response
             .json::<Vec<Torrent>>()
             .await
@@ -205,7 +384,8 @@ impl TorrentClient {
 
     /// Moves a completed torrent's payload to the directory configured for
     /// its category, then removes the torrent from qBittorrent (keeping the
-    /// moved files). Torrents in unmapped categories are left untouched.
+    /// moved files). Torrents in unmapped categories, or in states where
+    /// acting on the payload is unsafe, are left untouched.
     ///
     /// The torrent is stopped first so its file handles are released, and
     /// the operation is retry-safe: if a previous cycle moved the files but
@@ -214,6 +394,13 @@ impl TorrentClient {
         let Some(dest_dir) = self.server.categories.get(&torrent.category) else {
             return Ok(());
         };
+        if !torrent.state.safe_to_move() {
+            info!(
+                "Skipping '{}': state is {} (waiting for a safe state)",
+                torrent.name, torrent.state
+            );
+            return Ok(());
+        }
         let src = self.resolve_source_path(torrent)?;
         let dest_dir = PathBuf::from(dest_dir);
 
@@ -383,22 +570,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_completed_torrents() {
+    async fn test_get_torrents() {
         let mut server = Server::new_async().await;
         let m = server
-            .mock("GET", "/api/v2/torrents/info?filter=completed")
+            .mock("GET", "/api/v2/torrents/info")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                r#"[{"save_path":"/downloads","name":"ubuntu.iso","category":"distros","hash":"abc123","content_path":"/downloads/ubuntu.iso"}]"#,
+                r#"[{"save_path":"/downloads","name":"ubuntu.iso","category":"distros","hash":"abc123","state":"uploading","content_path":"/downloads/ubuntu.iso"}]"#,
             )
             .create_async()
             .await;
 
         let client = TorrentClient::new(bypass_auth_config(server.url())).unwrap();
-        let torrents = client.get_completed_torrents().await.unwrap();
+        let torrents = client.get_torrents().await.unwrap();
         assert_eq!(torrents.len(), 1);
         assert_eq!(torrents[0].name, "ubuntu.iso");
+        assert_eq!(torrents[0].state, TorrentState::Uploading);
         assert_eq!(
             torrents[0].content_path.as_deref(),
             Some("/downloads/ubuntu.iso")
@@ -407,35 +595,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_completed_torrents_without_content_path() {
-        // Older qBittorrent versions may not report content_path.
+    async fn test_get_torrents_without_optional_fields() {
+        // Older qBittorrent versions may not report content_path; an
+        // unrecognized or missing state must parse as Unknown, not error.
         let mut server = Server::new_async().await;
         let _m = server
-            .mock("GET", "/api/v2/torrents/info?filter=completed")
+            .mock("GET", "/api/v2/torrents/info")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                r#"[{"save_path":"/downloads","name":"ubuntu.iso","category":"distros","hash":"abc123"}]"#,
+                r#"[{"save_path":"/downloads","name":"ubuntu.iso","category":"distros","hash":"abc123"},
+                    {"save_path":"/downloads","name":"other.iso","category":"distros","hash":"def456","state":"someFutureState"}]"#,
             )
             .create_async()
             .await;
 
         let client = TorrentClient::new(bypass_auth_config(server.url())).unwrap();
-        let torrents = client.get_completed_torrents().await.unwrap();
+        let torrents = client.get_torrents().await.unwrap();
         assert_eq!(torrents[0].content_path, None);
+        assert_eq!(torrents[0].state, TorrentState::Unknown);
+        assert_eq!(torrents[1].state, TorrentState::Unknown);
     }
 
     #[tokio::test]
     async fn test_http_error_status_is_reported() {
         let mut server = Server::new_async().await;
         let _m = server
-            .mock("GET", "/api/v2/torrents/info?filter=completed")
+            .mock("GET", "/api/v2/torrents/info")
             .with_status(403)
             .create_async()
             .await;
 
         let client = TorrentClient::new(bypass_auth_config(server.url())).unwrap();
-        assert!(client.get_completed_torrents().await.is_err());
+        assert!(client.get_torrents().await.is_err());
     }
 
     #[tokio::test]
@@ -524,6 +716,7 @@ mod tests {
             name: String::from("test_torrent"),
             category: String::from("test_category"),
             hash: String::from("test_hash"),
+            state: TorrentState::StoppedUpload,
             content_path: None,
         };
 
@@ -573,6 +766,7 @@ mod tests {
             name: String::from("season_pack"),
             category: String::from("tv"),
             hash: String::from("dir_hash"),
+            state: TorrentState::Uploading,
             content_path: Some(torrent_dir.to_str().unwrap().to_string()),
         };
 
@@ -600,6 +794,7 @@ mod tests {
             name: String::from("x"),
             category: String::from("unmapped"),
             hash: String::from("h"),
+            state: TorrentState::Uploading,
             content_path: None,
         };
         // No categories configured: must be a no-op, not an error.
@@ -619,6 +814,7 @@ mod tests {
             name: String::from("film.mkv"),
             category: String::from("movies"),
             hash: String::from("h"),
+            state: TorrentState::Uploading,
             content_path: Some(String::from("/downloads/movies/film.mkv")),
         };
         let resolved = client.resolve_source_path(&torrent)?;
@@ -647,6 +843,7 @@ mod tests {
             name: String::from("Some Show S01"),
             category: String::from("anime"),
             hash: String::from("h"),
+            state: TorrentState::Uploading,
             content_path: Some(String::from("/data/Anime/Some Show S01")),
         };
         let resolved = client.resolve_source_path(&torrent)?;
@@ -686,6 +883,7 @@ mod tests {
             name: String::from("x"),
             category: String::from("anime"),
             hash: String::from("h"),
+            state: TorrentState::Uploading,
             content_path: Some(String::from("/data/Anime/x")),
         };
         let resolved = client.resolve_source_path(&torrent)?;
@@ -726,6 +924,7 @@ mod tests {
             name: String::from("test_torrent"),
             category: String::from("test_category"),
             hash: String::from("test_hash"),
+            state: TorrentState::StalledUpload,
             content_path: None,
         };
 
@@ -751,6 +950,140 @@ mod tests {
 
         assert_eq!(move_path(&src, &dest_dir)?, MoveOutcome::AlreadyMoved);
         Ok(())
+    }
+
+    #[test]
+    fn test_state_deserialization_covers_both_api_generations() {
+        // qBittorrent 5.x spelling.
+        let t: TorrentState = serde_json::from_str(r#""stoppedUP""#).unwrap();
+        assert_eq!(t, TorrentState::StoppedUpload);
+        // qBittorrent 4.x spelling maps to the same variant.
+        let t: TorrentState = serde_json::from_str(r#""pausedUP""#).unwrap();
+        assert_eq!(t, TorrentState::StoppedUpload);
+        let t: TorrentState = serde_json::from_str(r#""pausedDL""#).unwrap();
+        assert_eq!(t, TorrentState::StoppedDownload);
+        let t: TorrentState = serde_json::from_str(r#""moving""#).unwrap();
+        assert_eq!(t, TorrentState::Moving);
+        // Unrecognized states must not fail deserialization.
+        let t: TorrentState = serde_json::from_str(r#""brandNewState""#).unwrap();
+        assert_eq!(t, TorrentState::Unknown);
+    }
+
+    #[test]
+    fn test_state_classification() {
+        // Download finished, safe to move.
+        for state in [
+            TorrentState::Uploading,
+            TorrentState::StoppedUpload,
+            TorrentState::QueuedUpload,
+            TorrentState::StalledUpload,
+            TorrentState::ForcedUpload,
+        ] {
+            assert!(state.download_finished(), "{state} should be finished");
+            assert!(state.safe_to_move(), "{state} should be safe to move");
+        }
+        // Download finished, but NOT safe to touch the payload.
+        for state in [TorrentState::CheckingUpload, TorrentState::Moving] {
+            assert!(state.download_finished(), "{state} should be finished");
+            assert!(!state.safe_to_move(), "{state} must not be safe to move");
+        }
+        // Not finished and never safe.
+        for state in [
+            TorrentState::Downloading,
+            TorrentState::QueuedDownload,
+            TorrentState::StalledDownload,
+            TorrentState::StoppedDownload,
+            TorrentState::CheckingDownload,
+            TorrentState::ForcedDownload,
+            TorrentState::FetchingMetadata,
+            TorrentState::Allocating,
+            TorrentState::CheckingResumeData,
+            TorrentState::Error,
+            TorrentState::MissingFiles,
+            TorrentState::Unknown,
+        ] {
+            assert!(!state.safe_to_move(), "{state} must not be safe to move");
+        }
+        assert!(TorrentState::Error.is_errored());
+        assert!(TorrentState::MissingFiles.is_errored());
+        assert!(!TorrentState::Uploading.is_errored());
+    }
+
+    /// Torrents in unsafe states (qBittorrent relocating them, rechecking,
+    /// or errored) must not be touched even when their category is mapped
+    /// and the source exists.
+    #[tokio::test]
+    async fn test_unsafe_states_are_not_moved() -> Result<()> {
+        let tmp_dir = tempfile::tempdir()?;
+        let src_dir = tmp_dir.path().join("src");
+        let dest_dir = tmp_dir.path().join("dest");
+        fs::create_dir_all(&src_dir)?;
+        let src_file = src_dir.join("test_torrent");
+        fs::File::create(&src_file)?;
+
+        // Any API call would fail (no server); the point is none is made.
+        let mut server_config = bypass_auth_config("http://127.0.0.1:1".to_string());
+        server_config.categories.insert(
+            "test_category".to_string(),
+            dest_dir.to_str().unwrap().to_string(),
+        );
+        let client = TorrentClient::new(server_config)?;
+
+        for state in [
+            TorrentState::Moving,
+            TorrentState::CheckingUpload,
+            TorrentState::Error,
+            TorrentState::MissingFiles,
+            TorrentState::Downloading,
+            TorrentState::Unknown,
+        ] {
+            let torrent = Torrent {
+                save_path: src_dir.to_str().unwrap().to_string(),
+                name: String::from("test_torrent"),
+                category: String::from("test_category"),
+                hash: String::from("test_hash"),
+                state,
+                content_path: None,
+            };
+            client.move_and_clean_torrent_files(&torrent).await?;
+            assert!(src_file.exists(), "{state}: payload must be untouched");
+            assert!(
+                !dest_dir.join("test_torrent").exists(),
+                "{state}: nothing must be moved"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_state_tracker_detects_transitions() {
+        let make = |hash: &str, state| Torrent {
+            save_path: String::from("/data"),
+            name: format!("torrent_{hash}"),
+            category: String::from("anime"),
+            hash: hash.to_string(),
+            state,
+            content_path: None,
+        };
+
+        let mut tracker = StateTracker::default();
+
+        // Cycle 1: one downloading torrent.
+        tracker.observe(&[make("a", TorrentState::Downloading)]);
+        assert_eq!(tracker.states.get("a"), Some(&TorrentState::Downloading));
+
+        // Cycle 2: it finished and started seeding; a new one appeared.
+        tracker.observe(&[
+            make("a", TorrentState::Uploading),
+            make("b", TorrentState::QueuedDownload),
+        ]);
+        assert_eq!(tracker.states.get("a"), Some(&TorrentState::Uploading));
+        assert_eq!(tracker.states.get("b"), Some(&TorrentState::QueuedDownload));
+
+        // Cycle 3: "a" was removed (moved out); "b" errored.
+        tracker.observe(&[make("b", TorrentState::Error)]);
+        assert_eq!(tracker.states.get("a"), None, "removed torrents are pruned");
+        assert_eq!(tracker.states.get("b"), Some(&TorrentState::Error));
     }
 
     #[test]

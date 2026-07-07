@@ -30,7 +30,7 @@ use tokio::sync::oneshot::channel as oneshot_channel;
 use tokio::sync::oneshot::Receiver as OneshotReceiver;
 use tokio::time::sleep;
 
-use crate::torrent::TorrentClient;
+use crate::torrent::{StateTracker, TorrentClient};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -58,13 +58,21 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn process_single_server(server: ServerConfig) -> Result<(), Error> {
+async fn process_single_server(
+    server: ServerConfig,
+    tracker: &mut StateTracker,
+) -> Result<(), Error> {
     let torrent_client = TorrentClient::new(server)?;
     torrent_client.login().await?;
 
-    let torrents = torrent_client.get_completed_torrents().await?;
+    let torrents = torrent_client.get_torrents().await?;
+    // Record every torrent's state and log transitions (e.g. downloading
+    // -> seeding, or anything -> errored) before deciding what to act on.
+    tracker.observe(&torrents);
+
     let tasks: Vec<_> = torrents
         .into_iter()
+        .filter(|torrent| torrent.state.download_finished())
         .map(|torrent| {
             let torrent_client = torrent_client.clone();
             tokio::spawn(async move {
@@ -83,10 +91,14 @@ async fn process_single_server(server: ServerConfig) -> Result<(), Error> {
     Ok(())
 }
 
-async fn process_all_servers(servers: &[ServerConfig]) -> Result<(), Error> {
+async fn process_all_servers(
+    servers: &[ServerConfig],
+    trackers: &mut [StateTracker],
+) -> Result<(), Error> {
     let tasks = servers
         .iter()
-        .map(|server| process_single_server(server.clone()));
+        .zip(trackers.iter_mut())
+        .map(|(server, tracker)| process_single_server(server.clone(), tracker));
     let results: Vec<_> = join_all(tasks).await;
 
     let errors: Vec<String> = servers
@@ -108,8 +120,11 @@ async fn process_all_servers(servers: &[ServerConfig]) -> Result<(), Error> {
 async fn main_loop(config: config::Config, mut shutdown_signal: OneshotReceiver<()>) -> Result<()> {
     // Guard against a zero delay, which would busy-loop against the servers.
     let poll_delay = Duration::from_secs(config.rate_limit_delay.max(1));
+    // One state tracker per server, persisted across polling cycles so
+    // torrent state transitions can be detected and logged.
+    let mut trackers = vec![StateTracker::default(); config.servers.len()];
     loop {
-        if let Err(e) = process_all_servers(&config.servers).await {
+        if let Err(e) = process_all_servers(&config.servers, &mut trackers).await {
             error!("Error processing servers: {:#}", e);
         }
 
@@ -145,7 +160,7 @@ mod tests {
             .create_async()
             .await;
         let info_mock = server
-            .mock("GET", "/api/v2/torrents/info?filter=completed")
+            .mock("GET", "/api/v2/torrents/info")
             .with_status(200)
             .with_body("[]")
             .expect(1)

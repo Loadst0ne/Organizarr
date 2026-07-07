@@ -24,6 +24,7 @@ This is a good fit for pipelines where completed downloads are handed off to oth
 == [[features]]Features
 
 * Monitor qBittorrent for completed torrents.
+* Full torrent state awareness: recognizes every qBittorrent state (4.x and 5.x), logs state transitions, and only acts when it is safe to do so.
 * Move completed torrents to directories based on their category, then remove them from qBittorrent (keeping the files).
 * Uses the torrent's `content_path`, so renamed torrents are moved correctly.
 * Remaps remote paths (e.g. Docker/seedbox mounts) via `path_prefix` and `root_path`.
@@ -116,6 +117,8 @@ max_log_file_size: "10M"       # accepts K/M/G with optional B suffix, e.g. "10M
 Notes:
 
 * Only torrents whose category appears in `categories` are touched; everything else is left alone.
+* The tool tracks each torrent's state (downloading, queued, stalled, seeding, stopped, checking, moving, errored, ...) and logs every state transition, including when a download finishes and when a torrent becomes errored.
+* Files are only moved in provably safe states (seeding, stalled, queued, stopped, or forced seeding — i.e. download finished and payload idle). Torrents that qBittorrent is itself relocating (`moving`), re-verifying (`checking`), or that are errored/missing files are skipped until they reach a safe state.
 * Before moving, the torrent is stopped (works with both the qBittorrent 5.x `stop` and 4.x `pause` API) so qBittorrent releases its file handles.
 * Files are moved (rename when possible, copy + delete across filesystems); existing destination paths are never overwritten.
 * After the files are moved, the torrent is deleted from qBittorrent *without* deleting its data.
