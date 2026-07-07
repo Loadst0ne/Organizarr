@@ -812,22 +812,31 @@ impl TorrentClient {
     /// Maps a local (host-side) destination directory back to the path
     /// qBittorrent itself sees, reversing the `path_prefix` -> `root_path`
     /// remapping. Destinations outside `root_path` are passed through
-    /// unchanged (assumed to already be qBittorrent-visible).
+    /// unchanged (assumed to already be qBittorrent-visible). Implemented
+    /// with normalized string operations so Windows-style host paths are
+    /// handled identically on every platform.
     fn resolve_remote_dest(&self, dest_dir: &Path) -> String {
+        let dest = dest_dir.to_string_lossy();
         if let (Some(prefix), Some(root)) = (
             self.server.path_prefix.as_deref().filter(|p| !p.is_empty()),
             self.server.root_path.as_deref().filter(|r| !r.is_empty()),
         ) {
-            if let Ok(relative) = dest_dir.strip_prefix(root) {
-                let mut remote = prefix.trim_end_matches('/').to_string();
-                for component in relative.components() {
-                    remote.push('/');
-                    remote.push_str(&component.as_os_str().to_string_lossy());
+            let norm_dest = dest.replace('\\', "/");
+            let norm_root = root.replace('\\', "/");
+            let norm_root = norm_root.trim_end_matches('/');
+            let prefix = prefix.trim_end_matches('/');
+            if let Some(rest) = norm_dest.strip_prefix(norm_root) {
+                if rest.is_empty() {
+                    return prefix.to_string();
                 }
-                return remote;
+                // Only treat it as inside root_path on a path-component
+                // boundary ("G:/data" must not match "G:/database").
+                if let Some(rel) = rest.strip_prefix('/') {
+                    return format!("{}/{}", prefix, rel.trim_end_matches('/'));
+                }
             }
         }
-        dest_dir.to_string_lossy().into_owned()
+        dest.into_owned()
     }
 
     /// Asks qBittorrent to relocate the torrent into `dest_dir` and keep
@@ -1594,6 +1603,16 @@ mod tests {
         assert_eq!(
             client.resolve_remote_dest(Path::new(r"G:\data\torrents\tv\Show S01")),
             "/data/tv/Show S01"
+        );
+        // Exactly root_path maps to exactly path_prefix.
+        assert_eq!(
+            client.resolve_remote_dest(Path::new(r"G:\data\torrents")),
+            "/data"
+        );
+        // Prefix matches only on a component boundary.
+        assert_eq!(
+            client.resolve_remote_dest(Path::new(r"G:\data\torrents-other\x")),
+            r"G:\data\torrents-other\x"
         );
         // Outside root_path: passed through (assumed qBittorrent-visible).
         assert_eq!(
