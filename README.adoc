@@ -17,6 +17,7 @@ A qBittorrent companion service that organizes your torrents with state-aware, f
 . <<ecosystem,Ecosystem Compatibility>>
 . <<docker-packaging,Running in Docker>>
 . <<contributing,Contributing>>
+. <<acknowledgements,Acknowledgements>>
 . <<license,License>>
 
 == [[overview]]Overview
@@ -94,6 +95,12 @@ If you find a bug or want to propose a new feature:
 . Create a new branch for your changes.
 . Make your changes.
 . Submit a pull request.
+
+== [[acknowledgements]]Acknowledgements
+
+Special thanks to *Harrison Chin*, the original author of the project this repository was built from.
+His work laid the foundation — the core idea of a lightweight, category-driven qBittorrent companion — upon which everything here was developed.
+Organizarr would not exist without that basis.
 
 == [[license]]License
 
