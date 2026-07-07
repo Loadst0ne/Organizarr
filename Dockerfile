@@ -11,9 +11,9 @@ FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=build /app/target/release/qbittorrent_mover /usr/local/bin/qbittorrent-mover
+COPY --from=build /app/target/release/organizarr /usr/local/bin/organizarr
 
 # The tool reads config.yaml from (and writes its log to) the working
 # directory; mount a volume here.
 WORKDIR /config
-ENTRYPOINT ["/usr/local/bin/qbittorrent-mover"]
+ENTRYPOINT ["/usr/local/bin/organizarr"]

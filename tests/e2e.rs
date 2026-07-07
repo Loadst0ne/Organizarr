@@ -1,6 +1,7 @@
 /*
-qBittorrent Mover - A tool to automatically move torrents to different categories based on their state.
+Organizarr - A qBittorrent companion that organizes torrents with state-aware rules, complementing the *arr suite.
 Copyright (C) 2023 Harrison Chin
+Copyright (C) 2026 Loadst0ne and Organizarr contributors
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU Affero General Public License as published
@@ -116,12 +117,12 @@ rate_limit_delay: 1
     fs::write(work.join("config.yaml"), config).expect("write config.yaml");
 
     // Start the real binary the way a user would, from the scratch dir.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_qbittorrent_mover"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_organizarr"))
         .current_dir(work)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn qbittorrent_mover binary");
+        .expect("spawn organizarr binary");
 
     // Wait for the daemon to complete the move (with a generous timeout).
     let dest_file = library.join("Some Show S01").join("Episode 01.mkv");

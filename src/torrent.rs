@@ -1,6 +1,7 @@
 /*
-qBittorrent Mover - A tool to automatically move torrents to different categories based on their state.
+Organizarr - A qBittorrent companion that organizes torrents with state-aware rules, complementing the *arr suite.
 Copyright (C) 2023 Harrison Chin
+Copyright (C) 2026 Loadst0ne and Organizarr contributors
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU Affero General Public License as published

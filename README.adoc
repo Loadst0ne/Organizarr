@@ -1,8 +1,8 @@
-= qBittorrent File Mover
+= Organizarr
 
 image:https://img.shields.io/badge/version-0.1.0-blue[]
 
-A Rust-based tool to automate the management of completed torrents in qBittorrent, moving files based on categories and ensuring seamless organization.
+A qBittorrent companion service that organizes your torrents with state-aware, fully configurable rules — the missing organizational link in the *arr ecosystem.
 
 == Table of Contents
 
@@ -21,7 +21,7 @@ A Rust-based tool to automate the management of completed torrents in qBittorren
 
 == [[overview]]Overview
 
-`qBittorrent File Mover` is designed to help users automatically manage their downloaded torrents.
+`Organizarr` is designed to help users automatically manage their downloaded torrents.
 Once a torrent completes downloading in qBittorrent, this tool checks its category, and based on predefined configurations, moves the downloaded file to the appropriate directory.
 After a successful move, the torrent is removed from qBittorrent (its files are kept).
 This is a good fit for pipelines where completed downloads are handed off to other tools (e.g. Sonarr/Radarr import directories).
@@ -61,8 +61,8 @@ This is a good fit for pipelines where completed downloads are handed off to oth
 1. Clone the repository:
 +
 ----
-$ git clone https://github.com/harrychin/qbittorrent-mover.git
-$ cd qbittorrent-mover
+$ git clone https://github.com/Loadst0ne/Organizarr.git
+$ cd Organizarr
 ----
 
 2. Build the project:
@@ -80,7 +80,7 @@ $ cargo build --release
 2. Execute the binary:
 +
 ----
-$ ./target/release/qbittorrent_mover
+$ ./target/release/organizarr
 ----
 
 3. The tool will now monitor qBittorrent for completed torrents and move them based on your configurations.
@@ -163,7 +163,7 @@ servers:
     #      - action: add_tags
     #        with: ["processed"]
 rate_limit_delay: 5            # seconds between polling cycles
-log_file: "qbittorrent-mover.log"
+log_file: "organizarr.log"
 max_log_file_size: "10M"       # accepts K/M/G with optional B suffix, e.g. "10MB"
 max_concurrent_moves: 2        # max simultaneous file operations per server
 errored_completed_action: remove  # keep | remove | remove_with_data
@@ -381,7 +381,7 @@ A `Dockerfile` is included (multi-stage build, ~90 MB runtime image, no OpenSSL 
 Build the image:
 
 ----
-$ docker build -t qbittorrent-mover .
+$ docker build -t organizarr .
 ----
 
 === docker-compose (fill in the blanks)
@@ -391,10 +391,10 @@ Copy, fill in your values, and uncomment *only* what you need to change — ever
 [source,yaml]
 ----
 services:
-  qbittorrent-mover:
-    image: qbittorrent-mover          # or ghcr.io/<you>/qbittorrent-mover once published
+  organizarr:
+    image: organizarr          # or ghcr.io/loadst0ne/organizarr once published
     build: .                          # remove if you use a prebuilt image
-    container_name: qbittorrent-mover
+    container_name: organizarr
     restart: unless-stopped
     volumes:
       # Config + log directory (config.yaml lives here; a template is
@@ -437,7 +437,7 @@ servers:
     #path_prefix: "/downloads"      # what qBittorrent reports
     #root_path: "/data/torrents"    # where this container sees the same data
 #rate_limit_delay: 5
-#log_file: "qbittorrent-mover.log"
+#log_file: "organizarr.log"
 #max_log_file_size: "10M"
 #max_concurrent_moves: 2
 #errored_completed_action: remove
@@ -446,11 +446,11 @@ servers:
 === docker run equivalent
 
 ----
-$ docker run -d --name qbittorrent-mover --restart unless-stopped \
+$ docker run -d --name organizarr --restart unless-stopped \
     -v ./config:/config \
     -v /path/to/downloads:/data/torrents \
     -v /path/to/media:/data/media \
-    qbittorrent-mover
+    organizarr
 ----
 
 [NOTE]
@@ -476,7 +476,7 @@ servers:
     path_prefix: "/data"           # what the container calls the download root
     root_path: 'G:\data\torrents'  # what the host calls the same directory
 rate_limit_delay: 5
-log_file: "qbittorrent-mover.log"
+log_file: "organizarr.log"
 max_log_file_size: "10M"
 ----
 

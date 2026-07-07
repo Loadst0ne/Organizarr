@@ -871,6 +871,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "organizarr"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fs_extra",
+ "futures",
+ "log",
+ "log4rs",
+ "mockito",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "tempfile",
+ "tokio",
+ "trash",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -952,25 +971,6 @@ checksum = "6f42ea446cab60335f76979ec15e12619a2165b5ae2c12166bef27d283a9fadf"
 dependencies = [
  "idna",
  "psl-types",
-]
-
-[[package]]
-name = "qbittorrent_mover"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "fs_extra",
- "futures",
- "log",
- "log4rs",
- "mockito",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "tempfile",
- "tokio",
- "trash",
 ]
 
 [[package]]

@@ -1,6 +1,7 @@
 /*
-qBittorrent Mover - A tool to automatically move torrents to different categories based on their state.
+Organizarr - A qBittorrent companion that organizes torrents with state-aware rules, complementing the *arr suite.
 Copyright (C) 2023 Harrison Chin
+Copyright (C) 2026 Loadst0ne and Organizarr contributors
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU Affero General Public License as published
@@ -97,7 +98,7 @@ fn default_max_concurrent_moves() -> usize {
 }
 
 fn default_log_file() -> String {
-    String::from("qbittorrent-mover.log")
+    String::from("organizarr.log")
 }
 
 fn default_max_log_file_size() -> String {
@@ -405,7 +406,7 @@ mod tests {
         let config = Config::default();
         assert!(config.servers.is_empty());
         assert_eq!(config.rate_limit_delay, 5);
-        assert_eq!(config.log_file, "qbittorrent-mover.log");
+        assert_eq!(config.log_file, "organizarr.log");
         assert_eq!(config.max_log_file_size, "10M");
     }
 
@@ -430,7 +431,7 @@ mod tests {
         let config = config.expect("Failed to load config");
         assert_eq!(config.servers.len(), 1);
         assert_eq!(config.rate_limit_delay, 5);
-        assert_eq!(config.log_file, "qbittorrent-mover.log");
+        assert_eq!(config.log_file, "organizarr.log");
         assert_eq!(config.max_log_file_size, "10M");
 
         fs::remove_file(filename).expect("Failed to remove file");

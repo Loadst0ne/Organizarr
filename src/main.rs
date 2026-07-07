@@ -1,6 +1,7 @@
 /*
-qBittorrent Mover - A tool to automatically move torrents to different categories based on their state.
+Organizarr - A qBittorrent companion that organizes torrents with state-aware rules, complementing the *arr suite.
 Copyright (C) 2023 Harrison Chin
+Copyright (C) 2026 Loadst0ne and Organizarr contributors
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU Affero General Public License as published
@@ -45,7 +46,7 @@ async fn main() -> Result<()> {
     })?;
 
     setup_logger(&config.log_file, &config.max_log_file_size)?;
-    info!("Starting qBittorrent Mover");
+    info!("Starting Organizarr");
 
     let (shutdown_sender, shutdown_receiver) = oneshot_channel();
 
@@ -57,7 +58,7 @@ async fn main() -> Result<()> {
 
     main_loop(config, shutdown_receiver).await?;
 
-    info!("Shutting down qBittorrent Mover");
+    info!("Shutting down Organizarr");
     Ok(())
 }
 
