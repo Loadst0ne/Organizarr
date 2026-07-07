@@ -28,3 +28,8 @@ target/
 
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
+
+# Runtime artifacts (logs and the user's config, which contains credentials)
+*.log
+*.log.*
+config.yaml

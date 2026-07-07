@@ -16,30 +16,35 @@ A Rust-based tool to automate the management of completed torrents in qBittorren
 
 == [[overview]]Overview
 
-`qBittorrent File Mover` is designed to help users automatically manage their downloaded torrents. 
+`qBittorrent File Mover` is designed to help users automatically manage their downloaded torrents.
 Once a torrent completes downloading in qBittorrent, this tool checks its category, and based on predefined configurations, moves the downloaded file to the appropriate directory.
+After a successful move, the torrent is removed from qBittorrent (its files are kept).
+This is a good fit for pipelines where completed downloads are handed off to other tools (e.g. Sonarr/Radarr import directories).
 
 == [[features]]Features
 
 * Monitor qBittorrent for completed torrents.
-* Move completed torrents to directories based on their category.
+* Move completed torrents to directories based on their category, then remove them from qBittorrent (keeping the files).
+* Uses the torrent's `content_path`, so renamed torrents are moved correctly.
+* Remaps remote paths (e.g. Docker/seedbox mounts) via `path_prefix` and `root_path`.
+* Authenticates against the qBittorrent Web API (cookie-based login); also supports WebUI setups with authentication bypass.
 * Supports multiple qBittorrent instances.
 * Rate limiting to avoid overloading the qBittorrent server.
 * Configurable via a YAML file.
-* Logging support.
+* Logging support (console and rolling log file).
 
 == [[prerequisites]]Prerequisites
 
 * Rust (latest stable version recommended).
-* qBittorrent with Web UI enabled.
+* qBittorrent with Web UI enabled (qBittorrent 4.2 or newer recommended).
 
 == [[installation]]Installation
 
 1. Clone the repository:
 +
 ----
-$ git clone https://github.com/harrychin/qbittorrent_file_mover.git
-$ cd qbittorrent_file_mover
+$ git clone https://github.com/harrychin/qbittorrent-mover.git
+$ cd qbittorrent-mover
 ----
 
 2. Build the project:
@@ -57,7 +62,7 @@ $ cargo build --release
 2. Execute the binary:
 +
 ----
-$ ./target/release/qbittorrent_file_mover
+$ ./target/release/qbittorrent_mover
 ----
 
 3. The tool will now monitor qBittorrent for completed torrents and move them based on your configurations.
@@ -87,18 +92,29 @@ We appreciate your input!
 
 This is an example of what your `config.yaml` should look like.
 Fill in the placeholders with your actual data.
+If the file does not exist, a default template is created on first run.
 
 [source,yaml]
 ----
 servers:
   - qbit_url: "http://localhost:8080"
-    username: "admin"
+    username: "admin"          # leave empty ("") if WebUI auth bypass is enabled
     password: "adminadmin"
-    categories: 
+    categories:
       distros: "/path/to/distros/directory"
-    root_path: ""
-    path_prefix: ""
-rate_limit_delay: 5
+    # Optional: remap paths when qBittorrent reports paths that differ from
+    # this machine's view of the filesystem (e.g. Docker or remote mounts).
+    # path_prefix is stripped from the path qBittorrent reports, and
+    # root_path is prepended in its place. Omit both if paths match.
+    #root_path: "/mnt/seedbox"
+    #path_prefix: "/downloads"
+rate_limit_delay: 5            # seconds between polling cycles
 log_file: "qbittorrent-mover.log"
-max_log_file_size: "10M"
+max_log_file_size: "10M"       # accepts K/M/G with optional B suffix, e.g. "10MB"
 ----
+
+Notes:
+
+* Only torrents whose category appears in `categories` are touched; everything else is left alone.
+* Files are moved (rename when possible, copy + delete across filesystems); existing destination paths are never overwritten.
+* After the files are moved, the torrent is deleted from qBittorrent *without* deleting its data.

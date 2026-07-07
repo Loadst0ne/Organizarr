@@ -21,16 +21,16 @@ edition = "2021"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "cookies"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-serde_yaml = "0.9"
-tokio = { version = "1", features = ["full"] }
+serde_yaml_ng = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
 log = "0.4"
 log4rs = "1"
-notify = "6"
 anyhow = "1"
-mockito = "1.1"
 futures = "0.3"
-tempfile = "3"
 fs_extra = "1"
+
+[dev-dependencies]
+mockito = "1"
+tempfile = "3"

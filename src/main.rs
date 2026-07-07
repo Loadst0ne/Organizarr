@@ -26,7 +26,6 @@ use futures::future::join_all;
 use log::{error, info};
 use logger::setup_logger;
 use std::time::Duration;
-use tokio;
 use tokio::sync::oneshot::channel as oneshot_channel;
 use tokio::sync::oneshot::Receiver as OneshotReceiver;
 use tokio::time::sleep;
@@ -35,14 +34,15 @@ use crate::torrent::TorrentClient;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    info!("Starting qBittorrent Mover");
-
+    // The logger needs settings from the config, so config errors can only
+    // go to stderr at this point.
     let config = config::load_config(CONFIG_FILE).map_err(|e| {
-        error!("Failed to load configuration: {}", e);
-        anyhow::Error::from(e)
+        eprintln!("Failed to load configuration: {}", e);
+        e
     })?;
 
     setup_logger(&config.log_file, &config.max_log_file_size)?;
+    info!("Starting qBittorrent Mover");
 
     let (shutdown_sender, shutdown_receiver) = oneshot_channel();
 
@@ -59,21 +59,27 @@ async fn main() -> Result<()> {
 }
 
 async fn process_single_server(server: ServerConfig) -> Result<(), Error> {
-    let torrent_client = TorrentClient::new(server);
-    let is_online = torrent::is_server_online(&torrent_client).await?;
-    if is_online {
-        let torrents = torrent::get_completed_torrents(&torrent_client).await?;
-        for torrent in torrents {
+    let torrent_client = TorrentClient::new(server)?;
+    torrent_client.login().await?;
+
+    let torrents = torrent_client.get_completed_torrents().await?;
+    let tasks: Vec<_> = torrents
+        .into_iter()
+        .map(|torrent| {
             let torrent_client = torrent_client.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    torrent::move_and_clean_torrent_files(&torrent_client, &torrent).await
-                {
-                    error!("Error moving and cleaning torrent files: {}", e);
+                if let Err(e) = torrent_client.move_and_clean_torrent_files(&torrent).await {
+                    error!("Error moving torrent '{}': {:#}", torrent.name, e);
                 }
-            });
-        }
-    }
+            })
+        })
+        .collect();
+    // Wait for all moves to finish before returning, so the next polling
+    // cycle can't pick up the same torrents while they are still in flight.
+    join_all(tasks).await;
+
+    // Best-effort session cleanup.
+    let _ = torrent_client.logout().await;
     Ok(())
 }
 
@@ -83,18 +89,28 @@ async fn process_all_servers(servers: &[ServerConfig]) -> Result<(), Error> {
         .map(|server| process_single_server(server.clone()));
     let results: Vec<_> = join_all(tasks).await;
 
-    let errors: Vec<Error> = results.into_iter().filter_map(|res| res.err()).collect();
+    let errors: Vec<String> = servers
+        .iter()
+        .zip(results)
+        .filter_map(|(server, res)| res.err().map(|e| format!("{}: {:#}", server.qbit_url, e)))
+        .collect();
     if !errors.is_empty() {
-        return Err(anyhow::anyhow!("Encountered {} errors", errors.len()));
+        return Err(anyhow::anyhow!(
+            "Encountered {} error(s): {}",
+            errors.len(),
+            errors.join("; ")
+        ));
     }
 
     Ok(())
 }
 
 async fn main_loop(config: config::Config, mut shutdown_signal: OneshotReceiver<()>) -> Result<()> {
+    // Guard against a zero delay, which would busy-loop against the servers.
+    let poll_delay = Duration::from_secs(config.rate_limit_delay.max(1));
     loop {
         if let Err(e) = process_all_servers(&config.servers).await {
-            error!("Error processing servers: {}", e);
+            error!("Error processing servers: {:#}", e);
         }
 
         tokio::select! {
@@ -102,7 +118,7 @@ async fn main_loop(config: config::Config, mut shutdown_signal: OneshotReceiver<
                 info!("Received shutdown signal. Exiting...");
                 break;
             }
-            _ = sleep(Duration::from_secs(config.rate_limit_delay)) => {}
+            _ = sleep(poll_delay) => {}
         }
     }
     Ok(())
@@ -113,7 +129,6 @@ mod tests {
     use super::*;
     use anyhow::Result;
     use mockito::Server;
-    use tokio;
 
     #[tokio::test]
     async fn test_main_loop() -> Result<()> {
@@ -121,18 +136,27 @@ mod tests {
         let (shutdown_sender, shutdown_receiver) = oneshot_channel();
 
         // Start the mock server
-        let mut server = Server::new();
-        let m1 = server
-            .mock("GET", "/api/v2/app/version")
+        let mut server = Server::new_async().await;
+        let login_mock = server
+            .mock("POST", "/api/v2/auth/login")
             .with_status(200)
+            .with_body("Ok.")
             .expect(1)
-            .create();
-        let m2 = server
+            .create_async()
+            .await;
+        let info_mock = server
             .mock("GET", "/api/v2/torrents/info?filter=completed")
             .with_status(200)
             .with_body("[]")
             .expect(1)
-            .create();
+            .create_async()
+            .await;
+        let logout_mock = server
+            .mock("POST", "/api/v2/auth/logout")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
 
         // Update the config to use the mock server
         let mut config = config::Config::default();
@@ -152,8 +176,9 @@ mod tests {
         let _ = main_loop_future.await?;
 
         // Verify the mock expectations
-        m1.assert();
-        m2.assert();
+        login_mock.assert_async().await;
+        info_mock.assert_async().await;
+        logout_mock.assert_async().await;
 
         Ok(())
     }
