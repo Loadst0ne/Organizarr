@@ -25,9 +25,14 @@ This is a good fit for pipelines where completed downloads are handed off to oth
 
 * Monitor qBittorrent for completed torrents.
 * Full torrent state awareness: recognizes every qBittorrent state (4.x and 5.x), logs state transitions, and only acts when it is safe to do so.
+* Lifecycle awareness: uses actual transfer data (`progress`, `amount_left`, `completion_on`) to tell whether an errored/queued/stopped torrent is before or after a completed download, and acts accordingly.
+* Automatic recovery of torrents that error before completing: recheck + restart with per-torrent exponential backoff (1 min doubling up to 1 h).
+* Configurable handling of torrents that error *after* completing (e.g. `missingFiles`): keep, remove the entry, or remove with data (honoring qBittorrent's "move to trash" preference).
 * Move completed torrents to directories based on their category, then remove them from qBittorrent (keeping the files).
+* Scales to clients with thousands of torrents: the torrent list is fetched in pages of 500, and file moves run with bounded concurrency (`max_concurrent_moves`).
 * Uses the torrent's `content_path`, so renamed torrents are moved correctly.
 * Remaps remote paths (e.g. Docker/seedbox mounts) via `path_prefix` and `root_path`.
+* Designed to complement the *arr suite (Sonarr/Radarr) post-import categories — see <<arr-integration,Sonarr / Radarr Integration>>.
 * Authenticates against the qBittorrent Web API (cookie-based login); also supports WebUI setups with authentication bypass.
 * Supports multiple qBittorrent instances.
 * Rate limiting to avoid overloading the qBittorrent server.
@@ -112,6 +117,8 @@ servers:
 rate_limit_delay: 5            # seconds between polling cycles
 log_file: "qbittorrent-mover.log"
 max_log_file_size: "10M"       # accepts K/M/G with optional B suffix, e.g. "10MB"
+max_concurrent_moves: 2        # max simultaneous file moves per server
+errored_completed_action: remove  # keep | remove | remove_with_data
 ----
 
 Notes:
@@ -119,10 +126,47 @@ Notes:
 * Only torrents whose category appears in `categories` are touched; everything else is left alone.
 * The tool tracks each torrent's state (downloading, queued, stalled, seeding, stopped, checking, moving, errored, ...) and logs every state transition, including when a download finishes and when a torrent becomes errored.
 * Files are only moved in provably safe states (seeding, stalled, queued, stopped, or forced seeding — i.e. download finished and payload idle). Torrents that qBittorrent is itself relocating (`moving`), re-verifying (`checking`), or that are errored/missing files are skipped until they reach a safe state.
+* Whether a download is actually complete is judged from transfer data (`progress`, `amount_left`, `completion_on`), not just the state name — so a torrent *stopped or queued at 100%* is moved, while one stopped halfway is left alone.
 * Before moving, the torrent is stopped (works with both the qBittorrent 5.x `stop` and 4.x `pause` API) so qBittorrent releases its file handles.
 * Files are moved (rename when possible, copy + delete across filesystems); existing destination paths are never overwritten.
 * After the files are moved, the torrent is deleted from qBittorrent *without* deleting its data.
 * Moves are retry-safe: if a cycle moves the files but fails to remove the torrent, the next cycle finishes the cleanup.
+* Torrent lists are fetched in pages of 500 and moves run at most `max_concurrent_moves` at a time, so clients saturated with thousands of torrents don't overload this tool or the disk.
+
+=== Errored torrents
+
+The action taken for an errored torrent depends on *where in its life* the error occurred:
+
+* *Before/during download* (payload incomplete): the tool attempts recovery — a recheck followed by a restart (`start` on 5.x, `resume` on 4.x) — with per-torrent exponential backoff (1 min, 2 min, 4 min, ... capped at 1 h), so a persistently broken torrent is not hammered every polling cycle. Recovery is non-destructive and applies to all torrents, mapped or not.
+* *After a completed download* (e.g. `missingFiles` because the payload was already imported/moved): the configured `errored_completed_action` is applied, but only to torrents in a mapped category:
+** `keep` — leave the torrent alone and log a warning.
+** `remove` (default) — remove the torrent from qBittorrent, keeping any files.
+** `remove_with_data` — remove the torrent and let qBittorrent delete its files too; this honors qBittorrent's own "move to trash" preference.
+
+== [[arr-integration]]Sonarr / Radarr Integration
+
+This tool is designed to complement the *arr suite's *Post-Import Category* feature.
+
+In Sonarr/Radarr, the qBittorrent download client settings offer a *Post-Import Category*: after a release is downloaded and imported into your library, the torrent is re-categorized so it stops showing up in the *arr activity queue. Per the official *arr documentation, *using a post-import category disables *arr's own completed-download-handling removal* — the torrent will seed in that category forever, and nothing cleans it up.
+
+That is exactly the gap this tool fills:
+
+1. In Sonarr/Radarr → Settings → Download Clients → qBittorrent, set *Category* (e.g. `tv-sonarr`) and *Post-Import Category* (e.g. `imported-tv`).
+2. In this tool's `config.yaml`, map *only the post-import category*:
++
+[source,yaml]
+----
+categories:
+  imported-tv: 'G:\media\archive\tv'
+----
+3. The lifecycle then becomes: *arr grabs the release → qBittorrent downloads it (category `tv-sonarr`, untouched by this tool) → *arr imports it (hardlink/copy into the library) and re-categorizes the torrent to `imported-tv` → this tool moves the leftover payload to your archive directory and removes the torrent from qBittorrent.
+
+[WARNING]
+====
+Never map the *active download category* (`tv-sonarr` in the example above) in this tool. Doing so would move the files *before* Sonarr/Radarr import them, breaking the import. Map only the post-import category, so this tool acts strictly *after* the *arr application has finished with the download.
+====
+
+If you rely on hardlinks for imports (the *arr-recommended setup), note that this tool *moves* the leftover payload. On the same filesystem the hardlinked library copy is unaffected (moving one link never touches the other); across filesystems the payload is copied and the original deleted, which likewise leaves the library copy intact.
 
 == Docker / Mixed-Environment Example
 

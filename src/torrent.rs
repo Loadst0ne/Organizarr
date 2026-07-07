@@ -16,17 +16,24 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
-use super::config::ServerConfig;
+use super::config::{ErroredCompletedAction, ServerConfig};
 use anyhow::{bail, Context, Result};
 use log::{info, warn};
 use reqwest::{Client, Response};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Page size used when listing torrents. Fetching in pages keeps memory and
+/// response sizes bounded on clients saturated with thousands of torrents.
+const TORRENT_PAGE_SIZE: usize = 500;
+/// First retry delay for the errored-torrent recovery backoff.
+const RECOVERY_BACKOFF_BASE: Duration = Duration::from_secs(60);
+/// Upper bound for the recovery backoff delay.
+const RECOVERY_BACKOFF_CAP: Duration = Duration::from_secs(3600);
 
 /// The state of a torrent as reported by the qBittorrent WebUI API in the
 /// `state` field of `torrents/info`. Covers both qBittorrent 5.x
@@ -157,10 +164,28 @@ impl std::fmt::Display for TorrentState {
 }
 
 /// Remembers each torrent's last observed state for one server, so that
-/// state transitions can be detected and logged across polling cycles.
+/// state transitions can be detected and logged across polling cycles, and
+/// tracks the exponential-backoff schedule for errored-torrent recovery.
 #[derive(Debug, Default, Clone)]
 pub struct StateTracker {
     states: std::collections::HashMap<String, TorrentState>,
+    retries: std::collections::HashMap<String, RetryState>,
+}
+
+/// Per-torrent recovery backoff bookkeeping.
+#[derive(Debug, Clone, Copy)]
+struct RetryState {
+    attempts: u32,
+    next_attempt: Instant,
+}
+
+/// Exponential backoff delay for the given (1-based) attempt number:
+/// 60s, 120s, 240s, ... capped at one hour.
+fn recovery_backoff_delay(attempts: u32) -> Duration {
+    let factor = 2u32.saturating_pow(attempts.saturating_sub(1));
+    RECOVERY_BACKOFF_BASE
+        .saturating_mul(factor)
+        .min(RECOVERY_BACKOFF_CAP)
 }
 
 impl StateTracker {
@@ -198,11 +223,32 @@ impl StateTracker {
                 }
             }
         }
+        // Forget retry schedules for torrents that recovered or disappeared.
+        self.retries
+            .retain(|hash, _| seen.get(hash).is_some_and(|s| s.is_errored()));
         self.states = seen;
+    }
+
+    /// True when an errored torrent's recovery may be attempted now, i.e.
+    /// it has never been attempted or its backoff delay has elapsed.
+    pub fn recovery_due(&self, hash: &str, now: Instant) -> bool {
+        self.retries.get(hash).is_none_or(|r| now >= r.next_attempt)
+    }
+
+    /// Records a recovery attempt for the torrent, scheduling the next one
+    /// with exponential backoff. Returns the attempt number (1-based).
+    pub fn record_recovery_attempt(&mut self, hash: &str, now: Instant) -> u32 {
+        let entry = self.retries.entry(hash.to_string()).or_insert(RetryState {
+            attempts: 0,
+            next_attempt: now,
+        });
+        entry.attempts = entry.attempts.saturating_add(1);
+        entry.next_attempt = now + recovery_backoff_delay(entry.attempts);
+        entry.attempts
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct Torrent {
     pub save_path: String,
     pub name: String,
@@ -218,6 +264,45 @@ pub struct Torrent {
     /// because it stays correct when a torrent's content is renamed.
     #[serde(default)]
     pub content_path: Option<String>,
+    /// Download progress as a fraction (0.0 to 1.0).
+    #[serde(default)]
+    pub progress: f64,
+    /// Bytes still to be downloaded.
+    #[serde(default)]
+    pub amount_left: i64,
+    /// Unix timestamp of when the download completed; 0 or negative while
+    /// the torrent is still incomplete.
+    #[serde(default)]
+    pub completion_on: i64,
+}
+
+impl Torrent {
+    /// True when the torrent's payload has been fully downloaded, judged
+    /// from actual transfer data rather than the (sometimes ambiguous)
+    /// state name. This is what disambiguates errored/queued/stopped
+    /// torrents *before* completion from the same states *after*
+    /// completion.
+    pub fn is_download_complete(&self) -> bool {
+        self.state.download_finished()
+            || self.progress >= 1.0
+            || (self.amount_left == 0 && self.completion_on > 0)
+    }
+
+    /// True when this tool may act on the torrent's payload: the download
+    /// is complete (per [`Self::is_download_complete`]) and the torrent is
+    /// in a state where qBittorrent is not actively using or relocating
+    /// the files. Stopped/queued download-side states qualify only when
+    /// the transfer data confirms completion.
+    pub fn eligible_for_move(&self) -> bool {
+        if !self.is_download_complete() {
+            return false;
+        }
+        self.state.safe_to_move()
+            || matches!(
+                self.state,
+                TorrentState::StoppedDownload | TorrentState::QueuedDownload
+            )
+    }
 }
 
 #[derive(Clone)]
@@ -308,37 +393,55 @@ impl TorrentClient {
 
     /// Fetches all torrents with their current states. The full list (not
     /// just completed torrents) is needed so state transitions such as
-    /// downloading -> seeding can be observed.
+    /// downloading -> seeding can be observed. The list is fetched in pages
+    /// of [`TORRENT_PAGE_SIZE`] so that clients saturated with thousands of
+    /// torrents don't produce one enormous request/response.
     pub async fn get_torrents(&self) -> Result<Vec<Torrent>> {
-        let response = self.get("/api/v2/torrents/info", &[]).await?;
-        let torrents = response
-            .json::<Vec<Torrent>>()
-            .await
-            .context("Failed to parse torrent list from qBittorrent")?;
-        Ok(torrents)
+        let mut all = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let limit = TORRENT_PAGE_SIZE.to_string();
+            let offset_str = offset.to_string();
+            let response = self
+                .get(
+                    "/api/v2/torrents/info",
+                    &[("limit", limit.as_str()), ("offset", offset_str.as_str())],
+                )
+                .await?;
+            let page = response
+                .json::<Vec<Torrent>>()
+                .await
+                .context("Failed to parse torrent list from qBittorrent")?;
+            let page_len = page.len();
+            all.extend(page);
+            if page_len < TORRENT_PAGE_SIZE {
+                break;
+            }
+            offset += page_len;
+        }
+        Ok(all)
     }
 
-    /// Removes the torrent from qBittorrent without deleting its files
-    /// (the files have already been moved by this tool).
-    pub async fn remove_torrent(&self, hash: &str) -> Result<()> {
+    /// Removes the torrent from qBittorrent. With `delete_files: false` the
+    /// payload is kept (used after this tool has moved it); with `true`
+    /// qBittorrent deletes the payload too, honoring its own "move to
+    /// trash" preference.
+    pub async fn remove_torrent(&self, hash: &str, delete_files: bool) -> Result<()> {
         self.post_form(
             "/api/v2/torrents/delete",
-            &[("hashes", hash), ("deleteFiles", "false")],
+            &[
+                ("hashes", hash),
+                ("deleteFiles", if delete_files { "true" } else { "false" }),
+            ],
         )
         .await?;
         Ok(())
     }
 
-    /// Stops the torrent so qBittorrent closes its file handles before the
-    /// payload is moved. This matters in particular when qBittorrent runs in
-    /// a container and this tool runs on the host: open handles held through
-    /// the bind-mount file-sharing layer (e.g. Docker Desktop) can otherwise
-    /// make the host-side move fail with sharing violations.
-    ///
-    /// qBittorrent 5.x renamed the endpoint from `torrents/pause` to
-    /// `torrents/stop`; the new name is tried first with a fallback for 4.x.
-    pub async fn stop_torrent(&self, hash: &str) -> Result<()> {
-        for endpoint in ["/api/v2/torrents/stop", "/api/v2/torrents/pause"] {
+    /// POSTs `hashes` to the first endpoint that exists, falling back on
+    /// 404. Used for endpoints renamed between qBittorrent 4.x and 5.x.
+    async fn post_hashes_with_fallback(&self, endpoints: &[&str], hash: &str) -> Result<()> {
+        for endpoint in endpoints {
             let url = self.url(endpoint);
             let response = self
                 .client
@@ -356,7 +459,119 @@ impl TorrentClient {
                 .with_context(|| format!("Request to {} returned an error status", url))?;
             return Ok(());
         }
-        bail!("Neither torrents/stop nor torrents/pause is available on this qBittorrent version");
+        bail!(
+            "None of {:?} is available on this qBittorrent version",
+            endpoints
+        );
+    }
+
+    /// Stops the torrent so qBittorrent closes its file handles before the
+    /// payload is moved. This matters in particular when qBittorrent runs in
+    /// a container and this tool runs on the host: open handles held through
+    /// the bind-mount file-sharing layer (e.g. Docker Desktop) can otherwise
+    /// make the host-side move fail with sharing violations.
+    ///
+    /// qBittorrent 5.x renamed the endpoint from `torrents/pause` to
+    /// `torrents/stop`; the new name is tried first with a fallback for 4.x.
+    pub async fn stop_torrent(&self, hash: &str) -> Result<()> {
+        self.post_hashes_with_fallback(&["/api/v2/torrents/stop", "/api/v2/torrents/pause"], hash)
+            .await
+    }
+
+    /// Starts (resumes) the torrent. qBittorrent 5.x renamed the endpoint
+    /// from `torrents/resume` to `torrents/start`; the new name is tried
+    /// first with a fallback for 4.x.
+    pub async fn start_torrent(&self, hash: &str) -> Result<()> {
+        self.post_hashes_with_fallback(&["/api/v2/torrents/start", "/api/v2/torrents/resume"], hash)
+            .await
+    }
+
+    /// Asks qBittorrent to re-verify the torrent's payload on disk.
+    pub async fn recheck_torrent(&self, hash: &str) -> Result<()> {
+        self.post_form("/api/v2/torrents/recheck", &[("hashes", hash)])
+            .await?;
+        Ok(())
+    }
+
+    /// Attempts to recover an errored torrent whose download has not yet
+    /// completed: re-verify the payload, then start it again.
+    pub async fn recover_torrent(&self, hash: &str) -> Result<()> {
+        self.recheck_torrent(hash).await?;
+        self.start_torrent(hash).await?;
+        Ok(())
+    }
+
+    /// Handles a torrent in an errored state, distinguishing where in its
+    /// life the error occurred:
+    ///
+    /// - **Before/during download** (transfer data shows the payload is
+    ///   incomplete): attempt recovery (recheck + start) on an exponential
+    ///   backoff schedule tracked per torrent in the [`StateTracker`], so a
+    ///   persistently broken torrent is not hammered every polling cycle.
+    /// - **After a completed download** (e.g. `missingFiles` after the
+    ///   payload was moved or deleted externally): apply the configured
+    ///   [`ErroredCompletedAction`]. Only torrents in a category mapped in
+    ///   this tool's config are acted on; anything else is left alone.
+    pub async fn handle_errored_torrent(
+        &self,
+        torrent: &Torrent,
+        tracker: &mut StateTracker,
+        action: ErroredCompletedAction,
+    ) {
+        if !torrent.is_download_complete() {
+            let now = Instant::now();
+            if !tracker.recovery_due(&torrent.hash, now) {
+                return;
+            }
+            let attempt = tracker.record_recovery_attempt(&torrent.hash, now);
+            info!(
+                "Attempting recovery of errored torrent '{}' (attempt {}, next retry in {:?} if it stays errored)",
+                torrent.name,
+                attempt,
+                recovery_backoff_delay(attempt.saturating_add(1))
+            );
+            if let Err(e) = self.recover_torrent(&torrent.hash).await {
+                warn!("Recovery of torrent '{}' failed: {:#}", torrent.name, e);
+            }
+            return;
+        }
+
+        // The download had already completed when the error occurred.
+        if !self.server.categories.contains_key(&torrent.category) {
+            return;
+        }
+        match action {
+            ErroredCompletedAction::Keep => {
+                warn!(
+                    "Torrent '{}' errored after completing its download ({}); keeping it as configured",
+                    torrent.name, torrent.state
+                );
+            }
+            ErroredCompletedAction::Remove => {
+                match self.remove_torrent(&torrent.hash, false).await {
+                    Ok(()) => info!(
+                        "Removed torrent '{}' (errored after completion: {}), files kept",
+                        torrent.name, torrent.state
+                    ),
+                    Err(e) => warn!(
+                        "Failed to remove errored torrent '{}': {:#}",
+                        torrent.name, e
+                    ),
+                }
+            }
+            ErroredCompletedAction::RemoveWithData => {
+                match self.remove_torrent(&torrent.hash, true).await {
+                    Ok(()) => info!(
+                        "Removed torrent '{}' and its files (errored after completion: {})",
+                        torrent.name, torrent.state
+                    ),
+                    Err(e) => warn!(
+                        "Failed to remove errored torrent '{}': {:#}",
+                        torrent.name, e
+                    ),
+                }
+            }
+        }
     }
 
     /// Maps the torrent's path on the qBittorrent host to a local path,
@@ -394,9 +609,9 @@ impl TorrentClient {
         let Some(dest_dir) = self.server.categories.get(&torrent.category) else {
             return Ok(());
         };
-        if !torrent.state.safe_to_move() {
+        if !torrent.eligible_for_move() {
             info!(
-                "Skipping '{}': state is {} (waiting for a safe state)",
+                "Skipping '{}': state is {} (waiting for a safe, completed state)",
                 torrent.name, torrent.state
             );
             return Ok(());
@@ -420,7 +635,9 @@ impl TorrentClient {
             .await
             .context("Move task panicked")??;
 
-        self.remove_torrent(&torrent.hash).await.with_context(|| {
+        self.remove_torrent(&torrent.hash, false)
+            .await
+            .with_context(|| {
             format!(
                 "Files for '{}' were moved to {:?}, but removing the torrent from qBittorrent failed",
                 torrent.name, dest_dir
@@ -574,6 +791,7 @@ mod tests {
         let mut server = Server::new_async().await;
         let m = server
             .mock("GET", "/api/v2/torrents/info")
+            .match_query(mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
@@ -601,6 +819,7 @@ mod tests {
         let mut server = Server::new_async().await;
         let _m = server
             .mock("GET", "/api/v2/torrents/info")
+            .match_query(mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
@@ -622,6 +841,7 @@ mod tests {
         let mut server = Server::new_async().await;
         let _m = server
             .mock("GET", "/api/v2/torrents/info")
+            .match_query(mockito::Matcher::Any)
             .with_status(403)
             .create_async()
             .await;
@@ -644,7 +864,7 @@ mod tests {
             .await;
 
         let client = TorrentClient::new(bypass_auth_config(server.url())).unwrap();
-        assert!(client.remove_torrent("test_hash").await.is_ok());
+        assert!(client.remove_torrent("test_hash", false).await.is_ok());
         m.assert_async().await;
     }
 
@@ -718,6 +938,7 @@ mod tests {
             hash: String::from("test_hash"),
             state: TorrentState::StoppedUpload,
             content_path: None,
+            ..Default::default()
         };
 
         let src_file = src_dir.join(&torrent.name);
@@ -768,6 +989,7 @@ mod tests {
             hash: String::from("dir_hash"),
             state: TorrentState::Uploading,
             content_path: Some(torrent_dir.to_str().unwrap().to_string()),
+            ..Default::default()
         };
 
         let mut server_config = bypass_auth_config(server.url());
@@ -796,6 +1018,7 @@ mod tests {
             hash: String::from("h"),
             state: TorrentState::Uploading,
             content_path: None,
+            ..Default::default()
         };
         // No categories configured: must be a no-op, not an error.
         client.move_and_clean_torrent_files(&torrent).await?;
@@ -816,6 +1039,7 @@ mod tests {
             hash: String::from("h"),
             state: TorrentState::Uploading,
             content_path: Some(String::from("/downloads/movies/film.mkv")),
+            ..Default::default()
         };
         let resolved = client.resolve_source_path(&torrent)?;
         assert_eq!(
@@ -845,6 +1069,7 @@ mod tests {
             hash: String::from("h"),
             state: TorrentState::Uploading,
             content_path: Some(String::from("/data/Anime/Some Show S01")),
+            ..Default::default()
         };
         let resolved = client.resolve_source_path(&torrent)?;
         assert_eq!(
@@ -885,6 +1110,7 @@ mod tests {
             hash: String::from("h"),
             state: TorrentState::Uploading,
             content_path: Some(String::from("/data/Anime/x")),
+            ..Default::default()
         };
         let resolved = client.resolve_source_path(&torrent)?;
         assert_eq!(
@@ -926,6 +1152,7 @@ mod tests {
             hash: String::from("test_hash"),
             state: TorrentState::StalledUpload,
             content_path: None,
+            ..Default::default()
         };
 
         let mut server_config = bypass_auth_config(server.url());
@@ -1044,6 +1271,7 @@ mod tests {
                 hash: String::from("test_hash"),
                 state,
                 content_path: None,
+                ..Default::default()
             };
             client.move_and_clean_torrent_files(&torrent).await?;
             assert!(src_file.exists(), "{state}: payload must be untouched");
@@ -1064,6 +1292,7 @@ mod tests {
             hash: hash.to_string(),
             state,
             content_path: None,
+            ..Default::default()
         };
 
         let mut tracker = StateTracker::default();
@@ -1099,5 +1328,323 @@ mod tests {
         assert!(result.is_err());
         assert!(src.exists(), "source must be left intact");
         Ok(())
+    }
+
+    /// The torrent list must be fetched page by page so a client with
+    /// thousands of torrents cannot produce one enormous response.
+    #[tokio::test]
+    async fn test_get_torrents_paginates() {
+        let mut server = Server::new_async().await;
+
+        // First page: exactly TORRENT_PAGE_SIZE entries -> a next page is
+        // requested. Second page: a short page -> fetching stops.
+        let full_page: Vec<serde_json::Value> = (0..TORRENT_PAGE_SIZE)
+            .map(|i| {
+                serde_json::json!({
+                    "save_path": "/downloads",
+                    "name": format!("t{i}"),
+                    "category": "c",
+                    "hash": format!("h{i}"),
+                    "state": "uploading"
+                })
+            })
+            .collect();
+        let page1 = server
+            .mock("GET", "/api/v2/torrents/info")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("limit".into(), TORRENT_PAGE_SIZE.to_string()),
+                mockito::Matcher::UrlEncoded("offset".into(), "0".into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&full_page).unwrap())
+            .expect(1)
+            .create_async()
+            .await;
+        let page2 = server
+            .mock("GET", "/api/v2/torrents/info")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("limit".into(), TORRENT_PAGE_SIZE.to_string()),
+                mockito::Matcher::UrlEncoded("offset".into(), TORRENT_PAGE_SIZE.to_string()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"[{"save_path":"/downloads","name":"last","category":"c","hash":"hl","state":"uploading"}]"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = TorrentClient::new(bypass_auth_config(server.url())).unwrap();
+        let torrents = client.get_torrents().await.unwrap();
+        assert_eq!(torrents.len(), TORRENT_PAGE_SIZE + 1);
+        assert_eq!(torrents.last().unwrap().name, "last");
+        page1.assert_async().await;
+        page2.assert_async().await;
+    }
+
+    /// Transfer data (progress/amount_left/completion_on) disambiguates
+    /// states that occur both before and after a download completes.
+    #[test]
+    fn test_lifecycle_disambiguation() {
+        let t = |state, progress: f64, amount_left: i64, completion_on: i64| Torrent {
+            state,
+            progress,
+            amount_left,
+            completion_on,
+            ..Default::default()
+        };
+
+        // Errored before/during download: incomplete, not movable.
+        assert!(!t(TorrentState::Error, 0.0, 1000, 0).is_download_complete());
+        assert!(!t(TorrentState::Error, 0.42, 500, 0).is_download_complete());
+        // Errored after a completed download (e.g. missingFiles after an
+        // external move): complete, but still never movable.
+        let errored_done = t(TorrentState::MissingFiles, 1.0, 0, 1_700_000_000);
+        assert!(errored_done.is_download_complete());
+        assert!(!errored_done.eligible_for_move());
+
+        // Stopped before completion vs stopped after completion.
+        assert!(!t(TorrentState::StoppedDownload, 0.6, 400, 0).eligible_for_move());
+        assert!(t(TorrentState::StoppedDownload, 1.0, 0, 1_700_000_000).eligible_for_move());
+
+        // Queued before completion: untouched. Queued after: movable.
+        assert!(!t(TorrentState::QueuedDownload, 0.0, 1000, 0).eligible_for_move());
+        assert!(t(TorrentState::QueuedDownload, 1.0, 0, 1_700_000_000).eligible_for_move());
+        assert!(t(TorrentState::QueuedUpload, 1.0, 0, 1_700_000_000).eligible_for_move());
+
+        // amount_left == 0 alone (e.g. metadata not yet fetched) must not
+        // count as complete without a completion timestamp.
+        assert!(!t(TorrentState::FetchingMetadata, 0.0, 0, 0).is_download_complete());
+
+        // Upload-side states imply completion even without transfer data.
+        assert!(t(TorrentState::Uploading, 0.0, 0, 0).is_download_complete());
+
+        // Unsafe transitional states stay unmovable regardless of data.
+        assert!(!t(TorrentState::Moving, 1.0, 0, 1_700_000_000).eligible_for_move());
+        assert!(!t(TorrentState::CheckingUpload, 1.0, 0, 1_700_000_000).eligible_for_move());
+    }
+
+    #[test]
+    fn test_recovery_backoff_schedule() {
+        assert_eq!(recovery_backoff_delay(1), Duration::from_secs(60));
+        assert_eq!(recovery_backoff_delay(2), Duration::from_secs(120));
+        assert_eq!(recovery_backoff_delay(3), Duration::from_secs(240));
+        // Capped at one hour, even for absurd attempt counts.
+        assert_eq!(recovery_backoff_delay(10), Duration::from_secs(3600));
+        assert_eq!(recovery_backoff_delay(u32::MAX), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn test_state_tracker_recovery_backoff() {
+        let mut tracker = StateTracker::default();
+        let now = Instant::now();
+
+        // Never attempted: due immediately.
+        assert!(tracker.recovery_due("h", now));
+        assert_eq!(tracker.record_recovery_attempt("h", now), 1);
+        // Right after the first attempt: not due again yet.
+        assert!(!tracker.recovery_due("h", now));
+        assert!(!tracker.recovery_due("h", now + Duration::from_secs(59)));
+        // After the first backoff delay: due again.
+        assert!(tracker.recovery_due("h", now + Duration::from_secs(60)));
+        assert_eq!(
+            tracker.record_recovery_attempt("h", now + Duration::from_secs(60)),
+            2
+        );
+        // Second delay is doubled.
+        assert!(!tracker.recovery_due("h", now + Duration::from_secs(60 + 119)));
+        assert!(tracker.recovery_due("h", now + Duration::from_secs(60 + 120)));
+
+        // Other torrents are unaffected.
+        assert!(tracker.recovery_due("other", now));
+    }
+
+    /// Retry bookkeeping must be dropped once a torrent recovers (or is
+    /// removed), so a later unrelated error starts a fresh backoff.
+    #[test]
+    fn test_state_tracker_prunes_recovered_retries() {
+        let make = |hash: &str, state| Torrent {
+            hash: hash.to_string(),
+            name: format!("torrent_{hash}"),
+            state,
+            ..Default::default()
+        };
+        let mut tracker = StateTracker::default();
+        let now = Instant::now();
+
+        tracker.observe(&[make("a", TorrentState::Error)]);
+        tracker.record_recovery_attempt("a", now);
+        assert!(!tracker.recovery_due("a", now));
+
+        // The torrent recovered: its backoff schedule is forgotten.
+        tracker.observe(&[make("a", TorrentState::Downloading)]);
+        assert!(tracker.recovery_due("a", now));
+    }
+
+    #[tokio::test]
+    async fn test_start_torrent_falls_back_to_resume() {
+        // qBittorrent 4.x path: torrents/start is 404, torrents/resume works.
+        let mut server = Server::new_async().await;
+        let start_mock = server
+            .mock("POST", "/api/v2/torrents/start")
+            .with_status(404)
+            .create_async()
+            .await;
+        let resume_mock = server
+            .mock("POST", "/api/v2/torrents/resume")
+            .match_body(mockito::Matcher::UrlEncoded(
+                "hashes".into(),
+                "test_hash".into(),
+            ))
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let client = TorrentClient::new(bypass_auth_config(server.url())).unwrap();
+        assert!(client.start_torrent("test_hash").await.is_ok());
+        start_mock.assert_async().await;
+        resume_mock.assert_async().await;
+    }
+
+    /// A torrent that errors before its download completes gets a
+    /// recheck+start recovery attempt, and immediate re-observations are
+    /// suppressed by the backoff schedule.
+    #[tokio::test]
+    async fn test_errored_incomplete_torrent_is_recovered_with_backoff() {
+        let mut server = Server::new_async().await;
+        let recheck_mock = server
+            .mock("POST", "/api/v2/torrents/recheck")
+            .match_body(mockito::Matcher::UrlEncoded("hashes".into(), "eh".into()))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let start_mock = server
+            .mock("POST", "/api/v2/torrents/start")
+            .match_body(mockito::Matcher::UrlEncoded("hashes".into(), "eh".into()))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let delete_mock = server
+            .mock("POST", "/api/v2/torrents/delete")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let torrent = Torrent {
+            name: String::from("broken"),
+            category: String::from("anime"),
+            hash: String::from("eh"),
+            state: TorrentState::Error,
+            progress: 0.3,
+            amount_left: 700,
+            ..Default::default()
+        };
+        let mut server_config = bypass_auth_config(server.url());
+        server_config
+            .categories
+            .insert("anime".to_string(), "/dest".to_string());
+        let client = TorrentClient::new(server_config).unwrap();
+        let mut tracker = StateTracker::default();
+
+        client
+            .handle_errored_torrent(&torrent, &mut tracker, ErroredCompletedAction::Remove)
+            .await;
+        // Second observation in quick succession: backoff suppresses it,
+        // so the recheck/start mocks stay at exactly one hit each.
+        client
+            .handle_errored_torrent(&torrent, &mut tracker, ErroredCompletedAction::Remove)
+            .await;
+
+        recheck_mock.assert_async().await;
+        start_mock.assert_async().await;
+        delete_mock.assert_async().await;
+    }
+
+    /// A torrent that errored *after* completing its download is handled
+    /// according to the configured action.
+    #[tokio::test]
+    async fn test_errored_completed_torrent_actions() {
+        let torrent = Torrent {
+            name: String::from("gone"),
+            category: String::from("anime"),
+            hash: String::from("ch"),
+            state: TorrentState::MissingFiles,
+            progress: 1.0,
+            completion_on: 1_700_000_000,
+            ..Default::default()
+        };
+
+        // remove: delete the torrent entry, keep files.
+        let mut server = Server::new_async().await;
+        let delete_mock = server
+            .mock("POST", "/api/v2/torrents/delete")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("hashes".into(), "ch".into()),
+                mockito::Matcher::UrlEncoded("deleteFiles".into(), "false".into()),
+            ]))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let mut server_config = bypass_auth_config(server.url());
+        server_config
+            .categories
+            .insert("anime".to_string(), "/dest".to_string());
+        let client = TorrentClient::new(server_config).unwrap();
+        let mut tracker = StateTracker::default();
+        client
+            .handle_errored_torrent(&torrent, &mut tracker, ErroredCompletedAction::Remove)
+            .await;
+        delete_mock.assert_async().await;
+
+        // remove_with_data: qBittorrent deletes the payload too (honoring
+        // its own trash preference).
+        let mut server = Server::new_async().await;
+        let delete_mock = server
+            .mock("POST", "/api/v2/torrents/delete")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("hashes".into(), "ch".into()),
+                mockito::Matcher::UrlEncoded("deleteFiles".into(), "true".into()),
+            ]))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let mut server_config = bypass_auth_config(server.url());
+        server_config
+            .categories
+            .insert("anime".to_string(), "/dest".to_string());
+        let client = TorrentClient::new(server_config).unwrap();
+        client
+            .handle_errored_torrent(
+                &torrent,
+                &mut tracker,
+                ErroredCompletedAction::RemoveWithData,
+            )
+            .await;
+        delete_mock.assert_async().await;
+
+        // keep: no API call at all (unreachable server would fail loudly).
+        let mut server_config = bypass_auth_config("http://127.0.0.1:1".to_string());
+        server_config
+            .categories
+            .insert("anime".to_string(), "/dest".to_string());
+        let client = TorrentClient::new(server_config).unwrap();
+        client
+            .handle_errored_torrent(&torrent, &mut tracker, ErroredCompletedAction::Keep)
+            .await;
+
+        // Unmapped category: never touched, regardless of action.
+        let client =
+            TorrentClient::new(bypass_auth_config("http://127.0.0.1:1".to_string())).unwrap();
+        client
+            .handle_errored_torrent(
+                &torrent,
+                &mut tracker,
+                ErroredCompletedAction::RemoveWithData,
+            )
+            .await;
     }
 }

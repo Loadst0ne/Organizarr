@@ -21,8 +21,9 @@ mod logger;
 mod torrent;
 
 use anyhow::{Error, Result};
-use config::{ServerConfig, CONFIG_FILE};
+use config::{Config, ErroredCompletedAction, ServerConfig, CONFIG_FILE};
 use futures::future::join_all;
+use futures::StreamExt;
 use log::{error, info};
 use logger::setup_logger;
 use std::time::Duration;
@@ -30,7 +31,7 @@ use tokio::sync::oneshot::channel as oneshot_channel;
 use tokio::sync::oneshot::Receiver as OneshotReceiver;
 use tokio::time::sleep;
 
-use crate::torrent::{StateTracker, TorrentClient};
+use crate::torrent::{StateTracker, Torrent, TorrentClient};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -61,6 +62,8 @@ async fn main() -> Result<()> {
 async fn process_single_server(
     server: ServerConfig,
     tracker: &mut StateTracker,
+    max_concurrent_moves: usize,
+    errored_action: ErroredCompletedAction,
 ) -> Result<(), Error> {
     let torrent_client = TorrentClient::new(server)?;
     torrent_client.login().await?;
@@ -70,38 +73,55 @@ async fn process_single_server(
     // -> seeding, or anything -> errored) before deciding what to act on.
     tracker.observe(&torrents);
 
-    let tasks: Vec<_> = torrents
+    // Errored torrents get lifecycle-aware handling: backoff recovery when
+    // the download is incomplete, the configured removal action otherwise.
+    // Handled sequentially: these are cheap API calls, not file moves.
+    let (errored, rest): (Vec<_>, Vec<_>) = torrents
         .into_iter()
-        .filter(|torrent| torrent.state.download_finished())
-        .map(|torrent| {
+        .partition(|torrent| torrent.state.is_errored());
+    for torrent in &errored {
+        torrent_client
+            .handle_errored_torrent(torrent, tracker, errored_action)
+            .await;
+    }
+
+    // Move completed torrents with bounded concurrency so that a client
+    // saturated with thousands of eligible torrents cannot spawn thousands
+    // of simultaneous file moves. All moves finish before this returns, so
+    // the next polling cycle can't double-process a torrent mid-move.
+    futures::stream::iter(rest.into_iter().filter(Torrent::eligible_for_move))
+        .for_each_concurrent(max_concurrent_moves.max(1), |torrent| {
             let torrent_client = torrent_client.clone();
-            tokio::spawn(async move {
+            async move {
                 if let Err(e) = torrent_client.move_and_clean_torrent_files(&torrent).await {
                     error!("Error moving torrent '{}': {:#}", torrent.name, e);
                 }
-            })
+            }
         })
-        .collect();
-    // Wait for all moves to finish before returning, so the next polling
-    // cycle can't pick up the same torrents while they are still in flight.
-    join_all(tasks).await;
+        .await;
 
     // Best-effort session cleanup.
     let _ = torrent_client.logout().await;
     Ok(())
 }
 
-async fn process_all_servers(
-    servers: &[ServerConfig],
-    trackers: &mut [StateTracker],
-) -> Result<(), Error> {
-    let tasks = servers
+async fn process_all_servers(config: &Config, trackers: &mut [StateTracker]) -> Result<(), Error> {
+    let tasks = config
+        .servers
         .iter()
         .zip(trackers.iter_mut())
-        .map(|(server, tracker)| process_single_server(server.clone(), tracker));
+        .map(|(server, tracker)| {
+            process_single_server(
+                server.clone(),
+                tracker,
+                config.max_concurrent_moves,
+                config.errored_completed_action,
+            )
+        });
     let results: Vec<_> = join_all(tasks).await;
 
-    let errors: Vec<String> = servers
+    let errors: Vec<String> = config
+        .servers
         .iter()
         .zip(results)
         .filter_map(|(server, res)| res.err().map(|e| format!("{}: {:#}", server.qbit_url, e)))
@@ -124,7 +144,7 @@ async fn main_loop(config: config::Config, mut shutdown_signal: OneshotReceiver<
     // torrent state transitions can be detected and logged.
     let mut trackers = vec![StateTracker::default(); config.servers.len()];
     loop {
-        if let Err(e) = process_all_servers(&config.servers, &mut trackers).await {
+        if let Err(e) = process_all_servers(&config, &mut trackers).await {
             error!("Error processing servers: {:#}", e);
         }
 
@@ -161,6 +181,7 @@ mod tests {
             .await;
         let info_mock = server
             .mock("GET", "/api/v2/torrents/info")
+            .match_query(mockito::Matcher::Any)
             .with_status(200)
             .with_body("[]")
             .expect(1)

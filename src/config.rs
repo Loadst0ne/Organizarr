@@ -34,10 +34,38 @@ pub struct Config {
     /// Maximum log file size, e.g. "500K", "10M", "10MB", "1GB".
     #[serde(default = "default_max_log_file_size")]
     pub max_log_file_size: String,
+    /// Maximum number of torrents whose files are moved concurrently per
+    /// server. Keeps disk and network I/O bounded even when thousands of
+    /// torrents become eligible at once.
+    #[serde(default = "default_max_concurrent_moves")]
+    pub max_concurrent_moves: usize,
+    /// What to do with a torrent that errored *after* its download had
+    /// already completed (e.g. `missingFiles`), when its category is mapped:
+    /// - `keep`: leave it alone (only log a warning).
+    /// - `remove`: remove the torrent from qBittorrent, keep any files.
+    /// - `remove_with_data`: remove the torrent and ask qBittorrent to
+    ///   delete its files too (honors qBittorrent's own "move to trash"
+    ///   preference).
+    #[serde(default)]
+    pub errored_completed_action: ErroredCompletedAction,
+}
+
+/// Action taken for torrents that error out after completing their download.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ErroredCompletedAction {
+    Keep,
+    #[default]
+    Remove,
+    RemoveWithData,
 }
 
 fn default_rate_limit_delay() -> u64 {
     5
+}
+
+fn default_max_concurrent_moves() -> usize {
+    2
 }
 
 fn default_log_file() -> String {
@@ -55,6 +83,8 @@ impl Default for Config {
             rate_limit_delay: default_rate_limit_delay(),
             log_file: default_log_file(),
             max_log_file_size: default_max_log_file_size(),
+            max_concurrent_moves: default_max_concurrent_moves(),
+            errored_completed_action: ErroredCompletedAction::default(),
         }
     }
 }
@@ -175,5 +205,32 @@ servers:
         assert_eq!(config.servers[0].root_path, None);
         assert_eq!(config.rate_limit_delay, 5);
         assert_eq!(config.max_log_file_size, "10M");
+        assert_eq!(config.max_concurrent_moves, 2);
+        assert_eq!(
+            config.errored_completed_action,
+            ErroredCompletedAction::Remove
+        );
+    }
+
+    #[test]
+    fn test_errored_completed_action_parsing() {
+        let yaml = r#"
+servers: []
+errored_completed_action: remove_with_data
+max_concurrent_moves: 8
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse");
+        assert_eq!(
+            config.errored_completed_action,
+            ErroredCompletedAction::RemoveWithData
+        );
+        assert_eq!(config.max_concurrent_moves, 8);
+
+        let yaml_keep = "servers: []\nerrored_completed_action: keep\n";
+        let config: Config = serde_yaml_ng::from_str(yaml_keep).expect("Failed to parse");
+        assert_eq!(
+            config.errored_completed_action,
+            ErroredCompletedAction::Keep
+        );
     }
 }
