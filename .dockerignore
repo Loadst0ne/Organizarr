@@ -1,0 +1,7 @@
+target/
+.git/
+.github/
+*.log
+config.yaml
+docker-compose*.yaml
+README.adoc

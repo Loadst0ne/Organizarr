@@ -20,7 +20,7 @@ use super::config::{ErroredCompletedAction, ServerConfig};
 use anyhow::{bail, Context, Result};
 use log::{info, warn};
 use reqwest::{Client, Response};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -38,7 +38,7 @@ const RECOVERY_BACKOFF_CAP: Duration = Duration::from_secs(3600);
 /// The state of a torrent as reported by the qBittorrent WebUI API in the
 /// `state` field of `torrents/info`. Covers both qBittorrent 5.x
 /// (`stoppedUP`/`stoppedDL`) and 4.x (`pausedUP`/`pausedDL`) spellings.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TorrentState {
     // Error states
     #[serde(rename = "error")]
@@ -169,6 +169,10 @@ impl std::fmt::Display for TorrentState {
 #[derive(Debug, Default, Clone)]
 pub struct StateTracker {
     states: std::collections::HashMap<String, TorrentState>,
+    /// Previous state (from the last cycle) for torrents whose state was
+    /// already known, captured by the most recent `observe` call. Used to
+    /// match state *transitions* in user rules and default behaviors.
+    previous: std::collections::HashMap<String, TorrentState>,
     retries: std::collections::HashMap<String, RetryState>,
 }
 
@@ -226,7 +230,16 @@ impl StateTracker {
         // Forget retry schedules for torrents that recovered or disappeared.
         self.retries
             .retain(|hash, _| seen.get(hash).is_some_and(|s| s.is_errored()));
+        self.previous = std::mem::take(&mut self.states);
+        // Previous states only make sense for torrents still present.
+        self.previous.retain(|hash, _| seen.contains_key(hash));
         self.states = seen;
+    }
+
+    /// The state this torrent was in on the previous cycle, if it was
+    /// known then. `None` for torrents observed for the first time.
+    pub fn previous_state(&self, hash: &str) -> Option<TorrentState> {
+        self.previous.get(hash).copied()
     }
 
     /// True when an errored torrent's recovery may be attempted now, i.e.
@@ -274,9 +287,32 @@ pub struct Torrent {
     /// the torrent is still incomplete.
     #[serde(default)]
     pub completion_on: i64,
+    /// Tags on the torrent, as reported by qBittorrent: a single
+    /// comma-separated string (e.g. `"tag1, tag2"`).
+    #[serde(default)]
+    pub tags: String,
+    /// Share ratio.
+    #[serde(default)]
+    pub ratio: f64,
+    /// Total seconds the torrent has been active.
+    #[serde(default)]
+    pub time_active: i64,
 }
 
 impl Torrent {
+    /// The torrent's tags as a trimmed list.
+    pub fn tag_list(&self) -> Vec<&str> {
+        self.tags
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
+
+    /// Time the torrent has been active, as a `Duration`.
+    pub fn active_duration(&self) -> Duration {
+        Duration::from_secs(self.time_active.max(0) as u64)
+    }
     /// True when the torrent's payload has been fully downloaded, judged
     /// from actual transfer data rather than the (sometimes ambiguous)
     /// state name. This is what disambiguates errored/queued/stopped
@@ -574,6 +610,146 @@ impl TorrentClient {
         }
     }
 
+    /// Creates a category in qBittorrent. A 409 Conflict (returned when the
+    /// category already exists) is treated as success; if the name was truly
+    /// invalid the subsequent `setCategory` call will surface the problem.
+    pub async fn create_category(&self, category: &str) -> Result<()> {
+        let url = self.url("/api/v2/torrents/createCategory");
+        let response = self
+            .client
+            .post(&url)
+            .form(&[("category", category), ("savePath", "")])
+            .send()
+            .await
+            .with_context(|| format!("Request to {} failed", url))?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            return Ok(());
+        }
+        response
+            .error_for_status()
+            .with_context(|| format!("Request to {} returned an error status", url))?;
+        Ok(())
+    }
+
+    /// Assigns the torrent to `category`, overwriting any existing category.
+    /// qBittorrent answers 409 Conflict when the category does not exist;
+    /// with `create_if_missing` the category is then created and the
+    /// assignment retried.
+    pub async fn set_category(
+        &self,
+        hash: &str,
+        category: &str,
+        create_if_missing: bool,
+    ) -> Result<()> {
+        let url = self.url("/api/v2/torrents/setCategory");
+        let form = [("hashes", hash), ("category", category)];
+        let response = self
+            .client
+            .post(&url)
+            .form(&form)
+            .send()
+            .await
+            .with_context(|| format!("Request to {} failed", url))?;
+        if response.status() == reqwest::StatusCode::CONFLICT && create_if_missing {
+            self.create_category(category).await?;
+            self.post_form("/api/v2/torrents/setCategory", &form)
+                .await
+                .with_context(|| {
+                    format!("Failed to set category {:?} after creating it", category)
+                })?;
+            return Ok(());
+        }
+        response
+            .error_for_status()
+            .with_context(|| format!("Request to {} returned an error status", url))?;
+        Ok(())
+    }
+
+    /// Adds tags (comma-separated) to the torrent. Unknown tags are created
+    /// by qBittorrent automatically.
+    pub async fn add_tags(&self, hash: &str, tags: &str) -> Result<()> {
+        self.post_form(
+            "/api/v2/torrents/addTags",
+            &[("hashes", hash), ("tags", tags)],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Removes tags (comma-separated) from the torrent.
+    pub async fn remove_tags(&self, hash: &str, tags: &str) -> Result<()> {
+        self.post_form(
+            "/api/v2/torrents/removeTags",
+            &[("hashes", hash), ("tags", tags)],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Removes every tag from the torrent. The torrent's current tags are
+    /// passed explicitly rather than relying on the "empty tags parameter
+    /// removes all tags" behavior, which varies between qBittorrent versions.
+    pub async fn clear_tags(&self, torrent: &Torrent) -> Result<()> {
+        let tags = torrent.tag_list().join(",");
+        if tags.is_empty() {
+            return Ok(());
+        }
+        self.remove_tags(&torrent.hash, &tags).await
+    }
+
+    /// Deletes the torrent's payload to the OS trash / recycle bin (resolved
+    /// through the configured path remapping, so the *host-side* copy of the
+    /// files is trashed), then removes the torrent entry from qBittorrent.
+    ///
+    /// Returns an error when trashing is not possible (e.g. the files live
+    /// on a mount without a trash location) so the caller can park the
+    /// torrent in the delete fallback category and retry on a later cycle.
+    pub async fn delete_torrent_to_trash(&self, torrent: &Torrent) -> Result<()> {
+        let src = self.resolve_source_path(torrent)?;
+        match self.stop_torrent(&torrent.hash).await {
+            // Let qBittorrent release its file handles first.
+            Ok(()) => sleep(Duration::from_millis(500)).await,
+            Err(e) => warn!(
+                "Could not stop torrent '{}' before trashing (continuing anyway): {:#}",
+                torrent.name, e
+            ),
+        }
+        let src_clone = src.clone();
+        let trashed = tokio::task::spawn_blocking(move || -> Result<bool> {
+            if !src_clone.exists() {
+                // Payload already gone (removed manually or by a previous
+                // cycle); only the torrent entry is left to clean up.
+                return Ok(false);
+            }
+            trash::delete(&src_clone)
+                .with_context(|| format!("Failed to move {:?} to the trash", src_clone))?;
+            Ok(true)
+        })
+        .await
+        .context("Trash task panicked")??;
+
+        self.remove_torrent(&torrent.hash, false)
+            .await
+            .with_context(|| {
+                format!(
+                    "Payload of '{}' was trashed, but removing the torrent from qBittorrent failed",
+                    torrent.name
+                )
+            })?;
+        if trashed {
+            info!(
+                "Moved payload of '{}' to the trash and removed it from qBittorrent",
+                torrent.name
+            );
+        } else {
+            info!(
+                "Payload of '{}' was already gone; removed it from qBittorrent",
+                torrent.name
+            );
+        }
+        Ok(())
+    }
+
     /// Maps the torrent's path on the qBittorrent host to a local path,
     /// applying the configured `path_prefix` -> `root_path` remapping.
     fn resolve_source_path(&self, torrent: &Torrent) -> Result<PathBuf> {
@@ -609,6 +785,15 @@ impl TorrentClient {
         let Some(dest_dir) = self.server.categories.get(&torrent.category) else {
             return Ok(());
         };
+        self.move_torrent_files_to(torrent, Path::new(dest_dir))
+            .await
+    }
+
+    /// Moves the torrent's payload into an explicit destination directory
+    /// (stop-before-move, path remapping and retry-safety included), then
+    /// removes the torrent from qBittorrent keeping the moved files. Used
+    /// both by the category-mapping flow and by `move_files` rule actions.
+    pub async fn move_torrent_files_to(&self, torrent: &Torrent, dest_dir: &Path) -> Result<()> {
         if !torrent.eligible_for_move() {
             info!(
                 "Skipping '{}': state is {} (waiting for a safe, completed state)",
@@ -617,7 +802,7 @@ impl TorrentClient {
             return Ok(());
         }
         let src = self.resolve_source_path(torrent)?;
-        let dest_dir = PathBuf::from(dest_dir);
+        let dest_dir = dest_dir.to_path_buf();
 
         match self.stop_torrent(&torrent.hash).await {
             // Give qBittorrent (and any container file-sharing layer) a
@@ -1646,5 +1831,217 @@ mod tests {
                 ErroredCompletedAction::RemoveWithData,
             )
             .await;
+    }
+
+    #[test]
+    fn test_move_path_handles_unicode_media_names() {
+        // Names representative of TV / movie / music / anime releases,
+        // including non-ASCII characters and awkward punctuation.
+        let names = [
+            "Some.Show.S01E01.1080p.WEB-DL",
+            "A Movie (2024) [Blu-ray]",
+            "Artist – Álbum Déluxe (FLAC)",
+            "アニメ作品 第01話 「はじまり」",
+        ];
+        let temp = tempfile::tempdir().unwrap();
+        for name in names {
+            let src_dir = temp.path().join("src");
+            let dest_dir = temp.path().join("dest");
+            fs::create_dir_all(&src_dir).unwrap();
+            let src = src_dir.join(name);
+            fs::write(&src, b"payload").unwrap();
+            let outcome = move_path(&src, &dest_dir).unwrap();
+            assert_eq!(outcome, MoveOutcome::Moved);
+            assert!(
+                dest_dir.join(name).exists(),
+                "missing moved file for {name}"
+            );
+            assert!(!src.exists());
+        }
+    }
+
+    #[test]
+    fn test_tag_list_parses_comma_separated_tags() {
+        let mut torrent = Torrent::default();
+        assert!(torrent.tag_list().is_empty());
+        torrent.tags = String::from("music, flac ,processed");
+        assert_eq!(torrent.tag_list(), vec!["music", "flac", "processed"]);
+        torrent.tags = String::from(" , ");
+        assert!(torrent.tag_list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_set_category() {
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/v2/torrents/setCategory")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("hashes".into(), "h1".into()),
+                mockito::Matcher::UrlEncoded("category".into(), "Seeding".into()),
+            ]))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let client = TorrentClient::new(bypass_auth_config(server.url())).unwrap();
+        assert!(client.set_category("h1", "Seeding", false).await.is_ok());
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_set_category_creates_missing_category() {
+        // qBittorrent answers 409 when the category doesn't exist; with
+        // create_if_missing the category must be created before retrying.
+        let mut server = Server::new_async().await;
+        let set_mock = server
+            .mock("POST", "/api/v2/torrents/setCategory")
+            .with_status(409)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let create_mock = server
+            .mock("POST", "/api/v2/torrents/createCategory")
+            .match_body(mockito::Matcher::UrlEncoded(
+                "category".into(),
+                "Seeding".into(),
+            ))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = TorrentClient::new(bypass_auth_config(server.url())).unwrap();
+        // The mock keeps answering 409 on the retry, so the overall call
+        // fails — but the create branch must have fired exactly once.
+        let result = client.set_category("h1", "Seeding", true).await;
+        assert!(result.is_err());
+        create_mock.assert_async().await;
+        set_mock.assert_async().await;
+
+        // Without create_if_missing, a 409 is a plain error and the
+        // category is never created.
+        let mut server = Server::new_async().await;
+        let _set = server
+            .mock("POST", "/api/v2/torrents/setCategory")
+            .with_status(409)
+            .create_async()
+            .await;
+        let create_mock = server
+            .mock("POST", "/api/v2/torrents/createCategory")
+            .expect(0)
+            .create_async()
+            .await;
+        let client = TorrentClient::new(bypass_auth_config(server.url())).unwrap();
+        assert!(client.set_category("h1", "Seeding", false).await.is_err());
+        create_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_create_category_conflict_is_ok() {
+        // 409 means the category already exists; that's success here.
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/v2/torrents/createCategory")
+            .with_status(409)
+            .create_async()
+            .await;
+        let client = TorrentClient::new(bypass_auth_config(server.url())).unwrap();
+        assert!(client.create_category("Seeding").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_add_and_remove_tags() {
+        let mut server = Server::new_async().await;
+        let add_mock = server
+            .mock("POST", "/api/v2/torrents/addTags")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("hashes".into(), "h1".into()),
+                mockito::Matcher::UrlEncoded("tags".into(), "a,b".into()),
+            ]))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let remove_mock = server
+            .mock("POST", "/api/v2/torrents/removeTags")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("hashes".into(), "h1".into()),
+                mockito::Matcher::UrlEncoded("tags".into(), "a,b".into()),
+            ]))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let client = TorrentClient::new(bypass_auth_config(server.url())).unwrap();
+        assert!(client.add_tags("h1", "a,b").await.is_ok());
+        assert!(client.remove_tags("h1", "a,b").await.is_ok());
+        add_mock.assert_async().await;
+        remove_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_clear_tags_passes_current_tags_and_skips_untagged() {
+        let mut server = Server::new_async().await;
+        let remove_mock = server
+            .mock("POST", "/api/v2/torrents/removeTags")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("hashes".into(), "h1".into()),
+                mockito::Matcher::UrlEncoded("tags".into(), "x,y".into()),
+            ]))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let client = TorrentClient::new(bypass_auth_config(server.url())).unwrap();
+
+        let mut torrent = Torrent {
+            hash: String::from("h1"),
+            tags: String::from("x, y"),
+            ..Default::default()
+        };
+        assert!(client.clear_tags(&torrent).await.is_ok());
+        remove_mock.assert_async().await;
+
+        // No tags: no API call (an unreachable server would error).
+        torrent.tags = String::new();
+        let offline = TorrentClient::new(bypass_auth_config("http://127.0.0.1:1".into())).unwrap();
+        assert!(offline.clear_tags(&torrent).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_delete_to_trash_with_missing_payload_removes_entry() {
+        // The payload is already gone (deleted manually or by an earlier
+        // cycle): the torrent entry must still be cleaned up, without
+        // asking qBittorrent to delete files.
+        let mut server = Server::new_async().await;
+        let stop_mock = server
+            .mock("POST", "/api/v2/torrents/stop")
+            .with_status(200)
+            .create_async()
+            .await;
+        let delete_mock = server
+            .mock("POST", "/api/v2/torrents/delete")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("hashes".into(), "h1".into()),
+                mockito::Matcher::UrlEncoded("deleteFiles".into(), "false".into()),
+            ]))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let torrent = Torrent {
+            hash: String::from("h1"),
+            name: String::from("gone_torrent"),
+            save_path: temp.path().to_string_lossy().into_owned(),
+            state: TorrentState::StoppedUpload,
+            progress: 1.0,
+            ..Default::default()
+        };
+        let client = TorrentClient::new(bypass_auth_config(server.url())).unwrap();
+        assert!(client.delete_torrent_to_trash(&torrent).await.is_ok());
+        stop_mock.assert_async().await;
+        delete_mock.assert_async().await;
     }
 }

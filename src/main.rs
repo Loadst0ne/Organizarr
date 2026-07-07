@@ -18,6 +18,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 mod config;
 mod logger;
+mod rules;
 mod torrent;
 
 use anyhow::{Error, Result};
@@ -26,12 +27,13 @@ use futures::future::join_all;
 use futures::StreamExt;
 use log::{error, info};
 use logger::setup_logger;
+use rules::Decision;
 use std::time::Duration;
 use tokio::sync::oneshot::channel as oneshot_channel;
 use tokio::sync::oneshot::Receiver as OneshotReceiver;
 use tokio::time::sleep;
 
-use crate::torrent::{StateTracker, Torrent, TorrentClient};
+use crate::torrent::{StateTracker, TorrentClient};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -65,7 +67,7 @@ async fn process_single_server(
     max_concurrent_moves: usize,
     errored_action: ErroredCompletedAction,
 ) -> Result<(), Error> {
-    let torrent_client = TorrentClient::new(server)?;
+    let torrent_client = TorrentClient::new(server.clone())?;
     torrent_client.login().await?;
 
     let torrents = torrent_client.get_torrents().await?;
@@ -73,28 +75,62 @@ async fn process_single_server(
     // -> seeding, or anything -> errored) before deciding what to act on.
     tracker.observe(&torrents);
 
+    // Decide once per torrent: ignore list > user rules > default
+    // behaviors. Errored torrents are separated out because their backoff
+    // bookkeeping mutates the tracker and must run sequentially.
+    let mut errored = Vec::new();
+    let mut work = Vec::new();
+    for torrent in torrents {
+        let previous = tracker.previous_state(&torrent.hash);
+        match rules::decide(&torrent, previous, &server) {
+            Decision::Ignore | Decision::None => {}
+            Decision::Errored => errored.push(torrent),
+            decision => work.push((torrent, decision)),
+        }
+    }
+
     // Errored torrents get lifecycle-aware handling: backoff recovery when
     // the download is incomplete, the configured removal action otherwise.
-    // Handled sequentially: these are cheap API calls, not file moves.
-    let (errored, rest): (Vec<_>, Vec<_>) = torrents
-        .into_iter()
-        .partition(|torrent| torrent.state.is_errored());
     for torrent in &errored {
         torrent_client
             .handle_errored_torrent(torrent, tracker, errored_action)
             .await;
     }
 
-    // Move completed torrents with bounded concurrency so that a client
-    // saturated with thousands of eligible torrents cannot spawn thousands
-    // of simultaneous file moves. All moves finish before this returns, so
-    // the next polling cycle can't double-process a torrent mid-move.
-    futures::stream::iter(rest.into_iter().filter(Torrent::eligible_for_move))
-        .for_each_concurrent(max_concurrent_moves.max(1), |torrent| {
+    // Apply the remaining decisions with bounded concurrency so that a
+    // client saturated with thousands of eligible torrents cannot spawn
+    // thousands of simultaneous file operations. All work finishes before
+    // this returns, so the next polling cycle can't double-process a
+    // torrent mid-move.
+    let behaviors = &server.behaviors;
+    futures::stream::iter(work)
+        .for_each_concurrent(max_concurrent_moves.max(1), |(torrent, decision)| {
             let torrent_client = torrent_client.clone();
             async move {
-                if let Err(e) = torrent_client.move_and_clean_torrent_files(&torrent).await {
-                    error!("Error moving torrent '{}': {:#}", torrent.name, e);
+                let result = match decision {
+                    Decision::UserRule(rule) => {
+                        rules::execute_rule(&torrent_client, &torrent, rule, &behaviors.delete)
+                            .await
+                    }
+                    Decision::RetryDelete | Decision::ForcedLimitExceeded => {
+                        rules::delete_with_fallback(&torrent_client, &torrent, &behaviors.delete)
+                            .await
+                    }
+                    Decision::MoveMapped => {
+                        torrent_client.move_and_clean_torrent_files(&torrent).await
+                    }
+                    Decision::SendToSeeding => {
+                        rules::send_to_seeding(
+                            &torrent_client,
+                            &torrent,
+                            &behaviors.send_to_seeding,
+                        )
+                        .await
+                    }
+                    Decision::Ignore | Decision::None | Decision::Errored => Ok(()),
+                };
+                if let Err(e) = result {
+                    error!("Error processing torrent '{}': {:#}", torrent.name, e);
                 }
             }
         })
@@ -215,6 +251,140 @@ mod tests {
         login_mock.assert_async().await;
         info_mock.assert_async().await;
         logout_mock.assert_async().await;
+
+        Ok(())
+    }
+
+    /// End-to-end pipeline check for the "Send to Seeding" default
+    /// behavior: a torrent observed downloading on cycle 1 and seeding on
+    /// cycle 2 must be re-categorized (with tags cleared) on cycle 2.
+    #[tokio::test]
+    async fn test_send_to_seeding_pipeline_across_cycles() -> Result<()> {
+        let mut server = Server::new_async().await;
+
+        let downloading = serde_json::json!([{
+            "hash": "abc123",
+            "name": "linux.iso",
+            "category": "",
+            "save_path": "/downloads",
+            "state": "downloading",
+            "progress": 0.5,
+            "amount_left": 1000,
+            "completion_on": 0,
+            "tags": "fresh"
+        }])
+        .to_string();
+        let seeding = serde_json::json!([{
+            "hash": "abc123",
+            "name": "linux.iso",
+            "category": "",
+            "save_path": "/downloads",
+            "state": "uploading",
+            "progress": 1.0,
+            "amount_left": 0,
+            "completion_on": 1700000000,
+            "tags": "fresh"
+        }])
+        .to_string();
+
+        let server_config = config::ServerConfig {
+            qbit_url: server.url(),
+            username: String::new(), // auth bypass: no login/logout
+            password: String::new(),
+            ..Default::default()
+        };
+        let mut tracker = StateTracker::default();
+
+        // Cycle 1: torrent is downloading; nothing may happen.
+        let info_cycle1 = server
+            .mock("GET", "/api/v2/torrents/info")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(&downloading)
+            .create_async()
+            .await;
+        let no_set = server
+            .mock("POST", "/api/v2/torrents/setCategory")
+            .expect(0)
+            .create_async()
+            .await;
+        process_single_server(
+            server_config.clone(),
+            &mut tracker,
+            2,
+            ErroredCompletedAction::Remove,
+        )
+        .await?;
+        info_cycle1.assert_async().await;
+        no_set.assert_async().await;
+        info_cycle1.remove_async().await;
+        no_set.remove_async().await;
+
+        // Cycle 2: the same torrent finished downloading -> send to
+        // seeding (overwrite category, clear tags).
+        let info_cycle2 = server
+            .mock("GET", "/api/v2/torrents/info")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(&seeding)
+            .create_async()
+            .await;
+        let set_mock = server
+            .mock("POST", "/api/v2/torrents/setCategory")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("hashes".into(), "abc123".into()),
+                mockito::Matcher::UrlEncoded("category".into(), "Seeding".into()),
+            ]))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let clear_mock = server
+            .mock("POST", "/api/v2/torrents/removeTags")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("hashes".into(), "abc123".into()),
+                mockito::Matcher::UrlEncoded("tags".into(), "fresh".into()),
+            ]))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        process_single_server(
+            server_config.clone(),
+            &mut tracker,
+            2,
+            ErroredCompletedAction::Remove,
+        )
+        .await?;
+        info_cycle2.assert_async().await;
+        set_mock.assert_async().await;
+        clear_mock.assert_async().await;
+        info_cycle2.remove_async().await;
+        set_mock.remove_async().await;
+        clear_mock.remove_async().await;
+
+        // Cycle 3: torrent is already seeding (no transition) -> nothing.
+        let info_cycle3 = server
+            .mock("GET", "/api/v2/torrents/info")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(&seeding)
+            .create_async()
+            .await;
+        let no_set = server
+            .mock("POST", "/api/v2/torrents/setCategory")
+            .expect(0)
+            .create_async()
+            .await;
+        process_single_server(
+            server_config,
+            &mut tracker,
+            2,
+            ErroredCompletedAction::Remove,
+        )
+        .await?;
+        info_cycle3.assert_async().await;
+        no_set.assert_async().await;
 
         Ok(())
     }
