@@ -116,5 +116,37 @@ max_log_file_size: "10M"       # accepts K/M/G with optional B suffix, e.g. "10M
 Notes:
 
 * Only torrents whose category appears in `categories` are touched; everything else is left alone.
+* Before moving, the torrent is stopped (works with both the qBittorrent 5.x `stop` and 4.x `pause` API) so qBittorrent releases its file handles.
 * Files are moved (rename when possible, copy + delete across filesystems); existing destination paths are never overwritten.
 * After the files are moved, the torrent is deleted from qBittorrent *without* deleting its data.
+* Moves are retry-safe: if a cycle moves the files but fails to remove the torrent, the next cycle finishes the cleanup.
+
+== Docker / Mixed-Environment Example
+
+A common setup: qBittorrent runs in a Linux container (e.g. behind gluetun in Docker Desktop on Windows), while this tool runs on the host.
+qBittorrent then reports container paths such as `/data/Anime/Some Show`, which live on the host at e.g. `G:\data\torrents\Anime\Some Show`.
+
+Use `path_prefix` (the container-side prefix) and `root_path` (the host-side equivalent) to bridge the two views:
+
+[source,yaml]
+----
+servers:
+  - qbit_url: "http://localhost:8080"
+    username: ""               # WebUI auth bypass enabled -> skip login
+    password: ""
+    categories:
+      anime: 'G:\media\Anime'  # host path where completed "anime" torrents go
+    path_prefix: "/data"           # what the container calls the download root
+    root_path: 'G:\data\torrents'  # what the host calls the same directory
+rate_limit_delay: 5
+log_file: "qbittorrent-mover.log"
+max_log_file_size: "10M"
+----
+
+With this config, a completed torrent at `/data/Anime/Some Show` (container view) is located at `G:\data\torrents\Anime\Some Show` (host view), moved to `G:\media\Anime\Some Show`, and then removed from qBittorrent.
+
+Tips:
+
+* `path_prefix` must match the container path exactly, including letter case (`/data`, not `/Data`) — container paths are case-sensitive.
+* Use single-quoted YAML strings for Windows paths (`'G:\data\torrents'`) so backslashes are not treated as escapes.
+* Destination directories (`categories`) are always host paths, since the move is performed by this tool on the host.

@@ -18,12 +18,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use super::config::ServerConfig;
 use anyhow::{bail, Context, Result};
-use log::info;
+use log::{info, warn};
 use reqwest::{Client, Response};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::time::sleep;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -149,6 +150,36 @@ impl TorrentClient {
         Ok(())
     }
 
+    /// Stops the torrent so qBittorrent closes its file handles before the
+    /// payload is moved. This matters in particular when qBittorrent runs in
+    /// a container and this tool runs on the host: open handles held through
+    /// the bind-mount file-sharing layer (e.g. Docker Desktop) can otherwise
+    /// make the host-side move fail with sharing violations.
+    ///
+    /// qBittorrent 5.x renamed the endpoint from `torrents/pause` to
+    /// `torrents/stop`; the new name is tried first with a fallback for 4.x.
+    pub async fn stop_torrent(&self, hash: &str) -> Result<()> {
+        for endpoint in ["/api/v2/torrents/stop", "/api/v2/torrents/pause"] {
+            let url = self.url(endpoint);
+            let response = self
+                .client
+                .post(&url)
+                .form(&[("hashes", hash)])
+                .send()
+                .await
+                .with_context(|| format!("Request to {} failed", url))?;
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                // Endpoint not present on this qBittorrent version; try next.
+                continue;
+            }
+            response
+                .error_for_status()
+                .with_context(|| format!("Request to {} returned an error status", url))?;
+            return Ok(());
+        }
+        bail!("Neither torrents/stop nor torrents/pause is available on this qBittorrent version");
+    }
+
     /// Maps the torrent's path on the qBittorrent host to a local path,
     /// applying the configured `path_prefix` -> `root_path` remapping.
     fn resolve_source_path(&self, torrent: &Torrent) -> Result<PathBuf> {
@@ -175,6 +206,10 @@ impl TorrentClient {
     /// Moves a completed torrent's payload to the directory configured for
     /// its category, then removes the torrent from qBittorrent (keeping the
     /// moved files). Torrents in unmapped categories are left untouched.
+    ///
+    /// The torrent is stopped first so its file handles are released, and
+    /// the operation is retry-safe: if a previous cycle moved the files but
+    /// failed to remove the torrent, the removal is completed this cycle.
     pub async fn move_and_clean_torrent_files(&self, torrent: &Torrent) -> Result<()> {
         let Some(dest_dir) = self.server.categories.get(&torrent.category) else {
             return Ok(());
@@ -182,9 +217,19 @@ impl TorrentClient {
         let src = self.resolve_source_path(torrent)?;
         let dest_dir = PathBuf::from(dest_dir);
 
+        match self.stop_torrent(&torrent.hash).await {
+            // Give qBittorrent (and any container file-sharing layer) a
+            // moment to actually release the file handles.
+            Ok(()) => sleep(Duration::from_millis(500)).await,
+            Err(e) => warn!(
+                "Could not stop torrent '{}' before moving (continuing anyway): {:#}",
+                torrent.name, e
+            ),
+        }
+
         // File operations are blocking; keep them off the async runtime.
         let (src_clone, dest_clone) = (src.clone(), dest_dir.clone());
-        tokio::task::spawn_blocking(move || move_path(&src_clone, &dest_clone))
+        let outcome = tokio::task::spawn_blocking(move || move_path(&src_clone, &dest_clone))
             .await
             .context("Move task panicked")??;
 
@@ -195,27 +240,49 @@ impl TorrentClient {
             )
         })?;
 
-        info!(
-            "Moved '{}' to {:?} and removed it from qBittorrent",
-            torrent.name, dest_dir
-        );
+        match outcome {
+            MoveOutcome::Moved => info!(
+                "Moved '{}' to {:?} and removed it from qBittorrent",
+                torrent.name, dest_dir
+            ),
+            MoveOutcome::AlreadyMoved => info!(
+                "'{}' was already present in {:?} (previous move); removed it from qBittorrent",
+                torrent.name, dest_dir
+            ),
+        }
         Ok(())
     }
+}
+
+/// Result of a [`move_path`] call.
+#[derive(Debug, PartialEq)]
+enum MoveOutcome {
+    /// The payload was moved to the destination.
+    Moved,
+    /// The payload was already at the destination and the source is gone —
+    /// a previous cycle moved the files but failed before finishing.
+    AlreadyMoved,
 }
 
 /// Moves `src` (file or directory) into `dest_dir`, preserving its name.
 /// Tries a cheap rename first (same-filesystem move) and falls back to
 /// copy + delete for cross-filesystem moves. Refuses to overwrite.
-fn move_path(src: &Path, dest_dir: &Path) -> Result<()> {
-    if !src.exists() {
-        bail!("Source path does not exist: {:?}", src);
-    }
+fn move_path(src: &Path, dest_dir: &Path) -> Result<MoveOutcome> {
     let file_name = src
         .file_name()
         .with_context(|| format!("Source path has no file name: {:?}", src))?;
+    let dest = dest_dir.join(file_name);
+
+    if !src.exists() {
+        if dest.exists() {
+            // Retry-safety: an earlier cycle completed the move but did not
+            // get to remove the torrent from qBittorrent.
+            return Ok(MoveOutcome::AlreadyMoved);
+        }
+        bail!("Source path does not exist: {:?}", src);
+    }
     fs::create_dir_all(dest_dir)
         .with_context(|| format!("Failed to create destination directory {:?}", dest_dir))?;
-    let dest = dest_dir.join(file_name);
     if dest.exists() {
         bail!(
             "Destination already exists, refusing to overwrite: {:?}",
@@ -224,7 +291,7 @@ fn move_path(src: &Path, dest_dir: &Path) -> Result<()> {
     }
 
     if fs::rename(src, &dest).is_ok() {
-        return Ok(());
+        return Ok(MoveOutcome::Moved);
     }
 
     if src.is_file() {
@@ -242,7 +309,7 @@ fn move_path(src: &Path, dest_dir: &Path) -> Result<()> {
     } else {
         bail!("Source path is not a file or directory: {:?}", src);
     }
-    Ok(())
+    Ok(MoveOutcome::Moved)
 }
 
 #[cfg(test)]
@@ -390,8 +457,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_stop_torrent_uses_stop_endpoint() {
+        // qBittorrent 5.x path: torrents/stop exists.
+        let mut server = Server::new_async().await;
+        let stop_mock = server
+            .mock("POST", "/api/v2/torrents/stop")
+            .match_body(mockito::Matcher::UrlEncoded(
+                "hashes".into(),
+                "test_hash".into(),
+            ))
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let client = TorrentClient::new(bypass_auth_config(server.url())).unwrap();
+        assert!(client.stop_torrent("test_hash").await.is_ok());
+        stop_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_stop_torrent_falls_back_to_pause() {
+        // qBittorrent 4.x path: torrents/stop is 404, torrents/pause works.
+        let mut server = Server::new_async().await;
+        let stop_mock = server
+            .mock("POST", "/api/v2/torrents/stop")
+            .with_status(404)
+            .create_async()
+            .await;
+        let pause_mock = server
+            .mock("POST", "/api/v2/torrents/pause")
+            .match_body(mockito::Matcher::UrlEncoded(
+                "hashes".into(),
+                "test_hash".into(),
+            ))
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let client = TorrentClient::new(bypass_auth_config(server.url())).unwrap();
+        assert!(client.stop_torrent("test_hash").await.is_ok());
+        stop_mock.assert_async().await;
+        pause_mock.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn test_move_and_clean_torrent_files() -> Result<()> {
         let mut server = Server::new_async().await;
+        let stop_mock = server
+            .mock("POST", "/api/v2/torrents/stop")
+            .with_status(200)
+            .create_async()
+            .await;
         let delete_mock = server
             .mock("POST", "/api/v2/torrents/delete")
             .with_status(200)
@@ -425,6 +541,7 @@ mod tests {
 
         assert!(!src_file.exists());
         assert!(dest_dir.join(&torrent.name).exists());
+        stop_mock.assert_async().await;
         delete_mock.assert_async().await;
 
         Ok(())
@@ -433,6 +550,11 @@ mod tests {
     #[tokio::test]
     async fn test_move_directory_is_not_nested() -> Result<()> {
         let mut server = Server::new_async().await;
+        let _stop_mock = server
+            .mock("POST", "/api/v2/torrents/stop")
+            .with_status(200)
+            .create_async()
+            .await;
         let _delete_mock = server
             .mock("POST", "/api/v2/torrents/delete")
             .with_status(200)
@@ -506,6 +628,128 @@ mod tests {
                 .join("movies")
                 .join("film.mkv")
         );
+        Ok(())
+    }
+
+    /// Regression test for the mixed Docker/host scenario: qBittorrent runs
+    /// in a Linux container reporting paths like `/data/Anime/...`, while
+    /// this tool runs on the Windows host where the bind mount lives at
+    /// `G:\data\torrents`.
+    #[test]
+    fn test_resolve_source_path_docker_container_to_windows_host() -> Result<()> {
+        let mut server_config = bypass_auth_config("http://127.0.0.1:1".to_string());
+        server_config.path_prefix = Some("/data".to_string());
+        server_config.root_path = Some(r"G:\data\torrents".to_string());
+        let client = TorrentClient::new(server_config)?;
+
+        let torrent = Torrent {
+            save_path: String::from("/data/Anime"),
+            name: String::from("Some Show S01"),
+            category: String::from("anime"),
+            hash: String::from("h"),
+            content_path: Some(String::from("/data/Anime/Some Show S01")),
+        };
+        let resolved = client.resolve_source_path(&torrent)?;
+        assert_eq!(
+            resolved,
+            PathBuf::from(r"G:\data\torrents")
+                .join("Anime")
+                .join("Some Show S01")
+        );
+
+        // Same mapping must hold when content_path is unavailable and the
+        // path is derived from save_path + name instead.
+        let torrent_no_content_path = Torrent {
+            content_path: None,
+            ..torrent
+        };
+        let resolved = client.resolve_source_path(&torrent_no_content_path)?;
+        assert_eq!(
+            resolved,
+            PathBuf::from(r"G:\data\torrents")
+                .join("Anime")
+                .join("Some Show S01")
+        );
+        Ok(())
+    }
+
+    /// A trailing slash on `path_prefix` must not break the mapping.
+    #[test]
+    fn test_resolve_source_path_prefix_trailing_slash() -> Result<()> {
+        let mut server_config = bypass_auth_config("http://127.0.0.1:1".to_string());
+        server_config.path_prefix = Some("/data/".to_string());
+        server_config.root_path = Some(r"G:\data\torrents".to_string());
+        let client = TorrentClient::new(server_config)?;
+
+        let torrent = Torrent {
+            save_path: String::from("/data/Anime"),
+            name: String::from("x"),
+            category: String::from("anime"),
+            hash: String::from("h"),
+            content_path: Some(String::from("/data/Anime/x")),
+        };
+        let resolved = client.resolve_source_path(&torrent)?;
+        assert_eq!(
+            resolved,
+            PathBuf::from(r"G:\data\torrents").join("Anime").join("x")
+        );
+        Ok(())
+    }
+
+    /// If a previous cycle moved the files but failed to remove the torrent,
+    /// the next cycle must finish the job instead of erroring forever.
+    #[tokio::test]
+    async fn test_already_moved_torrent_is_cleaned_up() -> Result<()> {
+        let mut server = Server::new_async().await;
+        let _stop_mock = server
+            .mock("POST", "/api/v2/torrents/stop")
+            .with_status(200)
+            .create_async()
+            .await;
+        let delete_mock = server
+            .mock("POST", "/api/v2/torrents/delete")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let tmp_dir = tempfile::tempdir()?;
+        let src_dir = tmp_dir.path().join("src");
+        let dest_dir = tmp_dir.path().join("dest");
+        fs::create_dir_all(&src_dir)?;
+        fs::create_dir_all(&dest_dir)?;
+        // The payload is already at the destination; the source is gone.
+        fs::File::create(dest_dir.join("test_torrent"))?;
+
+        let torrent = Torrent {
+            save_path: src_dir.to_str().unwrap().to_string(),
+            name: String::from("test_torrent"),
+            category: String::from("test_category"),
+            hash: String::from("test_hash"),
+            content_path: None,
+        };
+
+        let mut server_config = bypass_auth_config(server.url());
+        server_config.categories.insert(
+            torrent.category.clone(),
+            dest_dir.to_str().unwrap().to_string(),
+        );
+        let client = TorrentClient::new(server_config)?;
+
+        client.move_and_clean_torrent_files(&torrent).await?;
+        delete_mock.assert_async().await;
+        Ok(())
+    }
+
+    #[test]
+    fn test_move_path_reports_already_moved() -> Result<()> {
+        let tmp_dir = tempfile::tempdir()?;
+        let src = tmp_dir.path().join("gone").join("file.bin");
+        let dest_dir = tmp_dir.path().join("dest");
+        fs::create_dir_all(&dest_dir)?;
+        fs::File::create(dest_dir.join("file.bin"))?;
+
+        assert_eq!(move_path(&src, &dest_dir)?, MoveOutcome::AlreadyMoved);
         Ok(())
     }
 
