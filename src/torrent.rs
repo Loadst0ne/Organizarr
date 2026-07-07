@@ -17,7 +17,7 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
-use super::config::{ErroredCompletedAction, ServerConfig};
+use super::config::{AfterMove, ErroredCompletedAction, ServerConfig};
 use anyhow::{bail, Context, Result};
 use log::{info, warn};
 use reqwest::{Client, Response};
@@ -364,6 +364,11 @@ impl TorrentClient {
         format!("{}{}", self.server.qbit_url.trim_end_matches('/'), path)
     }
 
+    /// The configured post-move handling for this server.
+    pub fn after_move(&self) -> AfterMove {
+        self.server.after_move
+    }
+
     async fn get(&self, path: &str, query: &[(&str, &str)]) -> Result<Response> {
         let url = self.url(path);
         let response = self
@@ -472,6 +477,21 @@ impl TorrentClient {
             ],
         )
         .await?;
+        Ok(())
+    }
+
+    /// Asks qBittorrent to relocate the torrent to `location` via
+    /// `setLocation`. qBittorrent moves the payload itself (state becomes
+    /// `moving` while in flight) and continues seeding from the new
+    /// directory afterwards. `location` must be a path qBittorrent can see
+    /// (its own view of the filesystem, e.g. the in-container path).
+    pub async fn set_location(&self, hash: &str, location: &str) -> Result<()> {
+        self.post_form(
+            "/api/v2/torrents/setLocation",
+            &[("hashes", hash), ("location", location)],
+        )
+        .await
+        .with_context(|| format!("setLocation to {:?} failed", location))?;
         Ok(())
     }
 
@@ -774,14 +794,13 @@ impl TorrentClient {
         Ok(root_path.join(relative_path))
     }
 
-    /// Moves a completed torrent's payload to the directory configured for
-    /// its category, then removes the torrent from qBittorrent (keeping the
-    /// moved files). Torrents in unmapped categories, or in states where
-    /// acting on the payload is unsafe, are left untouched.
-    ///
-    /// The torrent is stopped first so its file handles are released, and
-    /// the operation is retry-safe: if a previous cycle moved the files but
-    /// failed to remove the torrent, the removal is completed this cycle.
+    /// Handles a completed torrent whose category is mapped to a destination
+    /// directory. What happens is governed by the server's `after_move`
+    /// setting: with `keep_seeding` (default) qBittorrent itself relocates
+    /// the payload and keeps seeding it; with `stop`/`remove` the payload is
+    /// moved host-side and the torrent entry is left stopped or removed.
+    /// Torrents in unmapped categories, or in states where acting on the
+    /// payload is unsafe, are left untouched.
     pub async fn move_and_clean_torrent_files(&self, torrent: &Torrent) -> Result<()> {
         let Some(dest_dir) = self.server.categories.get(&torrent.category) else {
             return Ok(());
@@ -790,10 +809,52 @@ impl TorrentClient {
             .await
     }
 
-    /// Moves the torrent's payload into an explicit destination directory
-    /// (stop-before-move, path remapping and retry-safety included), then
-    /// removes the torrent from qBittorrent keeping the moved files. Used
-    /// both by the category-mapping flow and by `move_files` rule actions.
+    /// Maps a local (host-side) destination directory back to the path
+    /// qBittorrent itself sees, reversing the `path_prefix` -> `root_path`
+    /// remapping. Destinations outside `root_path` are passed through
+    /// unchanged (assumed to already be qBittorrent-visible).
+    fn resolve_remote_dest(&self, dest_dir: &Path) -> String {
+        if let (Some(prefix), Some(root)) = (
+            self.server.path_prefix.as_deref().filter(|p| !p.is_empty()),
+            self.server.root_path.as_deref().filter(|r| !r.is_empty()),
+        ) {
+            if let Ok(relative) = dest_dir.strip_prefix(root) {
+                let mut remote = prefix.trim_end_matches('/').to_string();
+                for component in relative.components() {
+                    remote.push('/');
+                    remote.push_str(&component.as_os_str().to_string_lossy());
+                }
+                return remote;
+            }
+        }
+        dest_dir.to_string_lossy().into_owned()
+    }
+
+    /// Asks qBittorrent to relocate the torrent into `dest_dir` and keep
+    /// seeding it from there. The destination is translated to
+    /// qBittorrent's view of the filesystem when it lies under `root_path`;
+    /// already-relocated torrents are a no-op, making the flow retry-safe.
+    async fn relocate_via_client(&self, torrent: &Torrent, dest_dir: &Path) -> Result<()> {
+        let remote_dest = self.resolve_remote_dest(dest_dir);
+        if paths_equivalent(&torrent.save_path, &remote_dest) {
+            // Already living in the destination; nothing to do.
+            return Ok(());
+        }
+        self.set_location(&torrent.hash, &remote_dest).await?;
+        info!(
+            "Asked qBittorrent to relocate '{}' to {:?}; it keeps seeding from there",
+            torrent.name, remote_dest
+        );
+        Ok(())
+    }
+
+    /// Moves the torrent's payload into an explicit destination directory,
+    /// honoring the server's `after_move` setting. `keep_seeding` delegates
+    /// the move to qBittorrent (which keeps seeding); `stop` and `remove`
+    /// perform the move host-side (stop-before-move, path remapping and
+    /// retry-safety included) and then leave or remove the torrent entry.
+    /// Used both by the category-mapping flow and by `move_files` rule
+    /// actions.
     pub async fn move_torrent_files_to(&self, torrent: &Torrent, dest_dir: &Path) -> Result<()> {
         if !torrent.eligible_for_move() {
             info!(
@@ -801,6 +862,9 @@ impl TorrentClient {
                 torrent.name, torrent.state
             );
             return Ok(());
+        }
+        if self.server.after_move == AfterMove::KeepSeeding {
+            return self.relocate_via_client(torrent, dest_dir).await;
         }
         let src = self.resolve_source_path(torrent)?;
         let dest_dir = dest_dir.to_path_buf();
@@ -821,27 +885,45 @@ impl TorrentClient {
             .await
             .context("Move task panicked")??;
 
-        self.remove_torrent(&torrent.hash, false)
-            .await
-            .with_context(|| {
-            format!(
-                "Files for '{}' were moved to {:?}, but removing the torrent from qBittorrent failed",
-                torrent.name, dest_dir
-            )
-        })?;
+        if self.server.after_move == AfterMove::Remove {
+            self.remove_torrent(&torrent.hash, false)
+                .await
+                .with_context(|| {
+                    format!(
+                    "Files for '{}' were moved to {:?}, but removing the torrent from qBittorrent failed",
+                    torrent.name, dest_dir
+                )
+                })?;
+        }
 
-        match outcome {
-            MoveOutcome::Moved => info!(
+        match (outcome, self.server.after_move) {
+            (MoveOutcome::Moved, AfterMove::Remove) => info!(
                 "Moved '{}' to {:?} and removed it from qBittorrent",
                 torrent.name, dest_dir
             ),
-            MoveOutcome::AlreadyMoved => info!(
+            (MoveOutcome::AlreadyMoved, AfterMove::Remove) => info!(
                 "'{}' was already present in {:?} (previous move); removed it from qBittorrent",
+                torrent.name, dest_dir
+            ),
+            (MoveOutcome::Moved, _) => info!(
+                "Moved '{}' to {:?}; the stopped torrent entry stays in qBittorrent",
+                torrent.name, dest_dir
+            ),
+            (MoveOutcome::AlreadyMoved, _) => info!(
+                "'{}' was already present in {:?} (previous move); torrent entry left in qBittorrent",
                 torrent.name, dest_dir
             ),
         }
         Ok(())
     }
+}
+
+/// Compares two paths for equivalence, tolerating mixed separators and
+/// trailing separators (qBittorrent normalizes to forward slashes; the
+/// configuration may use either).
+fn paths_equivalent(a: &str, b: &str) -> bool {
+    let norm = |p: &str| p.replace('\\', "/").trim_end_matches('/').to_string();
+    norm(a) == norm(b)
 }
 
 /// Result of a [`move_path`] call.
@@ -1131,6 +1213,7 @@ mod tests {
         fs::File::create(&src_file)?;
 
         let mut server_config = bypass_auth_config(server.url());
+        server_config.after_move = AfterMove::Remove;
         server_config.categories.insert(
             torrent.category.clone(),
             dest_dir.to_str().unwrap().to_string(),
@@ -1179,6 +1262,7 @@ mod tests {
         };
 
         let mut server_config = bypass_auth_config(server.url());
+        server_config.after_move = AfterMove::Remove;
         server_config
             .categories
             .insert("tv".to_string(), dest_dir.to_str().unwrap().to_string());
@@ -1342,6 +1426,7 @@ mod tests {
         };
 
         let mut server_config = bypass_auth_config(server.url());
+        server_config.after_move = AfterMove::Remove;
         server_config.categories.insert(
             torrent.category.clone(),
             dest_dir.to_str().unwrap().to_string(),
@@ -1351,6 +1436,185 @@ mod tests {
         client.move_and_clean_torrent_files(&torrent).await?;
         delete_mock.assert_async().await;
         Ok(())
+    }
+
+    /// With the default `after_move: keep_seeding`, a mapped completed
+    /// torrent is relocated by qBittorrent itself (setLocation) and never
+    /// removed; no host-side file operation takes place.
+    #[tokio::test]
+    async fn test_keep_seeding_relocates_via_set_location() -> Result<()> {
+        let mut server = Server::new_async().await;
+        let set_location_mock = server
+            .mock("POST", "/api/v2/torrents/setLocation")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("hashes".into(), "keep_hash".into()),
+                mockito::Matcher::UrlEncoded("location".into(), "/media/anime".into()),
+            ]))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let delete_mock = server
+            .mock("POST", "/api/v2/torrents/delete")
+            .expect(0)
+            .create_async()
+            .await;
+        let stop_mock = server
+            .mock("POST", "/api/v2/torrents/stop")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let torrent = Torrent {
+            save_path: String::from("/downloads/anime"),
+            name: String::from("some_show"),
+            category: String::from("anime"),
+            hash: String::from("keep_hash"),
+            state: TorrentState::Uploading,
+            content_path: None,
+            ..Default::default()
+        };
+
+        let mut server_config = bypass_auth_config(server.url());
+        // Default after_move (KeepSeeding) is exercised deliberately.
+        assert_eq!(server_config.after_move, AfterMove::KeepSeeding);
+        server_config
+            .categories
+            .insert("anime".to_string(), "/media/anime".to_string());
+        let client = TorrentClient::new(server_config)?;
+
+        client.move_and_clean_torrent_files(&torrent).await?;
+
+        set_location_mock.assert_async().await;
+        delete_mock.assert_async().await;
+        stop_mock.assert_async().await;
+        Ok(())
+    }
+
+    /// A torrent already saving into the destination directory must be a
+    /// no-op under `keep_seeding` (retry safety across cycles).
+    #[tokio::test]
+    async fn test_keep_seeding_skips_already_relocated_torrent() -> Result<()> {
+        let mut server = Server::new_async().await;
+        let set_location_mock = server
+            .mock("POST", "/api/v2/torrents/setLocation")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let torrent = Torrent {
+            // Trailing slash and separator differences must not defeat
+            // the equivalence check.
+            save_path: String::from("/media/anime/"),
+            name: String::from("some_show"),
+            category: String::from("anime"),
+            hash: String::from("done_hash"),
+            state: TorrentState::Uploading,
+            content_path: None,
+            ..Default::default()
+        };
+
+        let mut server_config = bypass_auth_config(server.url());
+        server_config
+            .categories
+            .insert("anime".to_string(), "/media/anime".to_string());
+        let client = TorrentClient::new(server_config)?;
+
+        client.move_and_clean_torrent_files(&torrent).await?;
+        set_location_mock.assert_async().await;
+        Ok(())
+    }
+
+    /// With `after_move: stop`, the payload is moved host-side but the
+    /// torrent entry is left in qBittorrent (stopped), not removed.
+    #[tokio::test]
+    async fn test_after_move_stop_leaves_torrent_entry() -> Result<()> {
+        let mut server = Server::new_async().await;
+        let stop_mock = server
+            .mock("POST", "/api/v2/torrents/stop")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let delete_mock = server
+            .mock("POST", "/api/v2/torrents/delete")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let tmp_dir = tempfile::tempdir()?;
+        let src_dir = tmp_dir.path().join("src");
+        let dest_dir = tmp_dir.path().join("dest");
+        fs::create_dir_all(&src_dir)?;
+
+        let torrent = Torrent {
+            save_path: src_dir.to_str().unwrap().to_string(),
+            name: String::from("test_torrent"),
+            category: String::from("test_category"),
+            hash: String::from("stop_hash"),
+            state: TorrentState::StoppedUpload,
+            content_path: None,
+            ..Default::default()
+        };
+        let src_file = src_dir.join(&torrent.name);
+        fs::File::create(&src_file)?;
+
+        let mut server_config = bypass_auth_config(server.url());
+        server_config.after_move = AfterMove::Stop;
+        server_config.categories.insert(
+            torrent.category.clone(),
+            dest_dir.to_str().unwrap().to_string(),
+        );
+        let client = TorrentClient::new(server_config)?;
+
+        client.move_and_clean_torrent_files(&torrent).await?;
+
+        assert!(!src_file.exists());
+        assert!(dest_dir.join(&torrent.name).exists());
+        stop_mock.assert_async().await;
+        delete_mock.assert_async().await;
+        Ok(())
+    }
+
+    /// Host-side destinations under `root_path` are translated back into
+    /// qBittorrent's own view of the filesystem for `setLocation`;
+    /// anything else passes through unchanged.
+    #[test]
+    fn test_resolve_remote_dest_reverses_path_remapping() -> Result<()> {
+        let mut server_config = bypass_auth_config("http://127.0.0.1:1".to_string());
+        server_config.path_prefix = Some(String::from("/data"));
+        server_config.root_path = Some(String::from(r"G:\data\torrents"));
+        let client = TorrentClient::new(server_config)?;
+
+        // Under root_path: reverse-remapped to the container view.
+        assert_eq!(
+            client.resolve_remote_dest(Path::new(r"G:\data\torrents\Anime")),
+            "/data/Anime"
+        );
+        assert_eq!(
+            client.resolve_remote_dest(Path::new(r"G:\data\torrents\tv\Show S01")),
+            "/data/tv/Show S01"
+        );
+        // Outside root_path: passed through (assumed qBittorrent-visible).
+        assert_eq!(
+            client.resolve_remote_dest(Path::new("/media/anime")),
+            "/media/anime"
+        );
+
+        // Without remapping configured, everything passes through.
+        let plain = TorrentClient::new(bypass_auth_config("http://127.0.0.1:1".to_string()))?;
+        assert_eq!(
+            plain.resolve_remote_dest(Path::new("/media/anime")),
+            "/media/anime"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_paths_equivalent() {
+        assert!(paths_equivalent("/media/anime", "/media/anime/"));
+        assert!(paths_equivalent(r"G:\media\anime", "G:/media/anime"));
+        assert!(!paths_equivalent("/media/anime", "/media/tv"));
     }
 
     #[test]

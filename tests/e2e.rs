@@ -98,12 +98,16 @@ async fn e2e_completed_torrent_is_moved_and_removed() {
         .await;
 
     // A real config.yaml, as a user would write it (empty username =
-    // qBittorrent WebUI auth bypass).
+    // qBittorrent WebUI auth bypass). `after_move: remove` selects the
+    // host-side move + remove flow this test observes end to end; the
+    // default (`keep_seeding`) delegates the move to qBittorrent itself
+    // and is covered by unit tests against the setLocation endpoint.
     let config = format!(
         r#"servers:
   - qbit_url: "{qbit_url}"
     username: ""
     password: ""
+    after_move: remove
     categories:
       anime: "{library}"
     root_path: "{root}"

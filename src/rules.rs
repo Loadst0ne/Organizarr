@@ -23,7 +23,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 //! torrents from everything.
 
 use crate::config::{
-    parse_duration, DeleteConfig, ForcedSeedingLimitConfig, Rule, RuleAction, RuleMatch,
+    parse_duration, AfterMove, DeleteConfig, ForcedSeedingLimitConfig, Rule, RuleAction, RuleMatch,
     SendToSeedingConfig, ServerConfig,
 };
 use crate::torrent::{Torrent, TorrentClient, TorrentState};
@@ -239,8 +239,12 @@ pub async fn execute_rule(
                 client
                     .move_torrent_files_to(torrent, Path::new(dest_dir))
                     .await?;
-                // The move flow removes the torrent from qBittorrent.
-                return Ok(());
+                // With `after_move: remove` the torrent no longer exists,
+                // so the action sequence must stop here. Otherwise the
+                // torrent is still in the client and later actions apply.
+                if client.after_move() == AfterMove::Remove {
+                    return Ok(());
+                }
             }
             RuleAction::Remove => {
                 client.remove_torrent(&torrent.hash, false).await?;

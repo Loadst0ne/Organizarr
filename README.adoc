@@ -22,35 +22,56 @@ A qBittorrent companion service that organizes your torrents with state-aware, f
 
 == [[overview]]Overview
 
-`Organizarr` is designed to help users automatically manage their downloaded torrents.
-Once a torrent completes downloading in qBittorrent, this tool checks its category, and based on predefined configurations, moves the downloaded file to the appropriate directory.
-After a successful move, the torrent is removed from qBittorrent (its files are kept).
-This is a good fit for pipelines where completed downloads are handed off to other tools (e.g. Sonarr/Radarr import directories).
+`Organizarr` watches qBittorrent and organizes torrents for you — *on your terms*. Every polling cycle it tracks each torrent's state and lifecycle, and applies either your own rules or a small set of sensible, fully tunable defaults.
+
+Out of the box, nothing is ever taken away from you: a torrent that finishes downloading is *sent to a Seeding category and keeps seeding*. What happens beyond that — re-categorizing, tagging, moving payloads into your library tree, pruning old seeds, deleting to the trash, or removing entries from the client — is entirely up to your configuration, including what happens to the torrent *inside qBittorrent itself* after its files are moved (`after_move: keep_seeding | stop | remove`).
+
+This makes it a natural companion to pipelines where completed downloads are handed off to other tools (e.g. Sonarr/Radarr/Lidarr post-import categories) — the missing organizational link in the *arr ecosystem.
 
 == [[features]]Features
 
-* Monitor qBittorrent for completed torrents.
-* Full torrent state awareness: recognizes every qBittorrent state (4.x and 5.x), logs state transitions, and only acts when it is safe to do so.
-* Lifecycle awareness: uses actual transfer data (`progress`, `amount_left`, `completion_on`) to tell whether an errored/queued/stopped torrent is before or after a completed download, and acts accordingly.
-* *Configurable rules engine*: define exactly what happens per state, state *transition*, category, tag, completeness, seed time, or ratio — set categories, add/remove tags, stop/start/recheck, move files, remove, or delete. First matching rule wins; rules always override the built-in defaults. See <<rules,Rules>>.
-* Three built-in default behaviors, each of which can be tuned or disabled (and *only* these three — nothing else happens by default beyond your `categories` mappings). See <<default-behaviors,Default Behaviors>>:
-** *Send to Seeding* — torrents that finish downloading are re-categorized to `Seeding` (created via the API if missing) and their tags are cleared.
-** *Forced-seeding limit* — forced-seeding (`forcedUP`) torrents active for longer than 7 days (and/or over a ratio you set) are deleted.
-** *Delete-to-trash* — payload deletions go to the OS trash / recycle bin; when the trash is unavailable, the torrent is parked in a `Delete` category and retried until it succeeds.
-* `ignore_categories`: list categories this tool must never touch, protecting the active categories of Sonarr/Radarr/Lidarr, unpackerr, and friends.
-* Automatic recovery of torrents that error before completing: recheck + restart with per-torrent exponential backoff (1 min doubling up to 1 h).
-* Configurable handling of torrents that error *after* completing (e.g. `missingFiles`): keep, remove the entry, or remove with data (honoring qBittorrent's "move to trash" preference).
-* Move completed torrents to directories based on their category, then remove them from qBittorrent (keeping the files).
-* Scales to clients with thousands of torrents: the torrent list is fetched in pages of 500, and file operations run with bounded concurrency (`max_concurrent_moves`).
+=== 🧠 State & lifecycle awareness
+
+* Recognizes *every* qBittorrent state (4.x *and* 5.x API spellings): downloading, queued, stalled, seeding, stopped/paused, forced, checking, moving, errored, missing files, metadata fetching, allocating, …
+* Detects *state transitions* between polling cycles ("finished downloading", "became errored", …) and logs every one.
+* Judges whether a download is actually complete from real transfer data (`progress`, `amount_left`, `completion_on`) — so a torrent *queued, stopped, or errored at 100%* is treated as finished, and one stopped halfway is left alone.
+* Only ever touches payloads in provably safe states; torrents qBittorrent is relocating (`moving`) or re-verifying (`checking`) are skipped until they settle.
+
+=== ⚙️ You are in control
+
+* *Configurable rules engine*: match on state, state *transition*, category, tag, completeness, seed time, or ratio — then set categories, add/remove tags, stop/start/recheck, move files, remove, or delete. First matching rule wins; rules always override the built-in defaults. See <<rules,Rules>>.
+* *Exactly three default behaviors* — nothing else happens without your say-so, and each can be tuned or disabled (see <<default-behaviors,Default Behaviors>>):
+** 🌱 *Send to Seeding* — finished torrents are re-categorized to `Seeding` (created via the API if missing) and their tags cleared. They keep seeding.
+** ⏳ *Forced-seeding limit* — forced (`forcedUP`) torrents active longer than 7 days (and/or over a ratio you set) are deleted.
+** 🗑️ *Delete-to-trash* — deletions go to the OS trash / recycle bin; when the trash is unavailable, the torrent is parked in a `Delete` category and retried until it succeeds.
+* *You decide what a "move" means* (`after_move`): let qBittorrent relocate the payload and *keep seeding* it (default), leave the stopped entry in the client, or remove the entry keeping the files.
+* `ignore_categories`: a hard shield — listed categories are never touched by any rule or behavior.
+
+=== 📦 Moving & file safety
+
+* Category → directory mappings move completed payloads into your library/archive tree.
 * Uses the torrent's `content_path`, so renamed torrents are moved correctly.
-* Remaps remote paths (e.g. Docker/seedbox mounts) via `path_prefix` and `root_path`.
-* Designed to complement the *arr suite (Sonarr/Radarr/Lidarr) post-import categories and the wider ecosystem (unpackerr, Overseerr/Jellyseerr, Requestrr, slskd/Nicotine+) — see <<arr-integration,*arr Suite Integration>> and <<ecosystem,Ecosystem Compatibility>>.
-* Authenticates against the qBittorrent Web API (cookie-based login); also supports WebUI setups with authentication bypass.
-* Supports multiple qBittorrent instances.
-* Rate limiting to avoid overloading the qBittorrent server.
-* Configurable via a YAML file.
-* Logging support (console and rolling log file).
+* Remaps container/seedbox paths to local paths (`path_prefix` / `root_path`) — and back again for client-side relocations.
+* Stop-before-move (5.x `stop` / 4.x `pause`) so file handles are released; rename when possible, copy + delete across filesystems; never overwrites an existing destination.
+* Every flow is *retry-safe*: a cycle interrupted mid-move is finished cleanly on the next one.
+
+=== 🩹 Error recovery
+
+* Torrents that error *before completing* are recovered automatically: recheck + restart with per-torrent exponential backoff (1 min doubling up to 1 h).
+* Torrents that error *after completing* (e.g. `missingFiles`) follow your configured `errored_completed_action`: keep, remove the entry, or remove with data (honoring qBittorrent's own trash preference).
+
+=== 🤝 Plays well with others
+
+* Purpose-built to complement the *arr suite's *Post-Import Category* flow (Sonarr, Radarr, Lidarr) — see <<arr-integration,*arr Suite Integration>>.
+* Documented compatibility with the wider ecosystem: unpackerr, Overseerr/Jellyseerr/Ombi, Requestrr, slskd/Nicotine+, Plex/Jellyfin/Emby — see <<ecosystem,Ecosystem Compatibility>>.
+* Supports multiple qBittorrent instances, WebUI auth or auth bypass, and rate-limited polling.
+
+=== 🚀 Built to run anywhere
+
+* Scales to clients with *thousands* of torrents: paged listing (500/page) and bounded concurrency (`max_concurrent_moves`).
+* Prebuilt release binaries for Windows (x64, x86), macOS (arm64, x64), and Linux (x64, arm, arm64, musl-x64, musl-arm64).
 * Ships with a `Dockerfile` and a fill-in-the-blanks `docker-compose` example — see <<docker-packaging,Running in Docker>>.
+* Single YAML config file; console + rolling file logging.
 
 == [[prerequisites]]Prerequisites
 
@@ -58,6 +79,12 @@ This is a good fit for pipelines where completed downloads are handed off to oth
 * qBittorrent with Web UI enabled (qBittorrent 4.2 or newer recommended).
 
 == [[installation]]Installation
+
+=== Prebuilt binaries (recommended)
+
+Grab the archive for your platform from the https://github.com/Loadst0ne/Organizarr/releases[releases page] — Windows (`windows-x64`, `windows-x86`), macOS (`osx-arm64`, `osx-x64`), and Linux (`linux-x64`, `linux-arm`, `linux-arm64`, `linux-musl-x64`, `linux-musl-arm64`) — extract it, and run the `organizarr` binary. The `musl` builds are fully static and run on Alpine, NAS appliances, and minimal containers.
+
+=== From source
 
 1. Clone the repository:
 +
@@ -127,6 +154,13 @@ servers:
     password: "adminadmin"
     categories:
       distros: "/path/to/distros/directory"
+    # Optional: what happens to the torrent in qBittorrent after its files
+    # are moved (categories mappings and move_files rule actions):
+    #   keep_seeding (default) - qBittorrent relocates the payload itself
+    #                            (setLocation) and KEEPS SEEDING it
+    #   stop                   - move host-side, leave the stopped entry
+    #   remove                 - move host-side, remove the entry (files kept)
+    #after_move: keep_seeding
     # Optional: remap paths when qBittorrent reports paths that differ from
     # this machine's view of the filesystem (e.g. Docker or remote mounts).
     # path_prefix is stripped from the path qBittorrent reports, and
@@ -182,10 +216,12 @@ Notes:
 * The tool tracks each torrent's state (downloading, queued, stalled, seeding, stopped, checking, moving, errored, ...) and logs every state transition, including when a download finishes and when a torrent becomes errored.
 * Files are only moved in provably safe states (seeding, stalled, queued, stopped, or forced seeding — i.e. download finished and payload idle). Torrents that qBittorrent is itself relocating (`moving`), re-verifying (`checking`), or that are errored/missing files are skipped until they reach a safe state.
 * Whether a download is actually complete is judged from transfer data (`progress`, `amount_left`, `completion_on`), not just the state name — so a torrent *stopped or queued at 100%* is moved, while one stopped halfway is left alone.
-* Before moving, the torrent is stopped (works with both the qBittorrent 5.x `stop` and 4.x `pause` API) so qBittorrent releases its file handles.
-* Files are moved (rename when possible, copy + delete across filesystems); existing destination paths are never overwritten.
-* After the files are moved, the torrent is deleted from qBittorrent *without* deleting its data.
-* Moves are retry-safe: if a cycle moves the files but fails to remove the torrent, the next cycle finishes the cleanup.
+* What a "move" is depends on `after_move`:
+** `keep_seeding` (default) — the move is delegated to qBittorrent (`setLocation`): it relocates the payload itself and *keeps seeding it* from the destination. The torrent stays in the client under your control (rules, forced-seeding limit, ...). The destination must be a path qBittorrent can see; a destination under `root_path` is automatically translated back to qBittorrent's view of the filesystem.
+** `stop` — this tool stops the torrent, moves the payload host-side (rename when possible, copy + delete across filesystems; existing destinations are never overwritten), and leaves the stopped entry in qBittorrent.
+** `remove` — as `stop`, but the entry is then removed from qBittorrent (its files are kept).
+* Before a host-side move, the torrent is stopped (works with both the qBittorrent 5.x `stop` and 4.x `pause` API) so qBittorrent releases its file handles.
+* Moves are retry-safe: an already-relocated torrent is a no-op, and if a cycle moves the files but fails the follow-up step, the next cycle finishes the job.
 * Torrent lists are fetched in pages of 500 and moves run at most `max_concurrent_moves` at a time, so clients saturated with thousands of torrents don't overload this tool or the disk.
 
 === Errored torrents
@@ -272,14 +308,14 @@ Available actions (`then`), each written as `action:` plus an optional `with:` p
 | `stop` | — | Stop (pause) the torrent (5.x `stop` / 4.x `pause`).
 | `start` | — | Start (resume) the torrent (5.x `start` / 4.x `resume`).
 | `recheck` | — | Re-verify the payload on disk.
-| `move_files` | string | Move the payload to this directory (stop-before-move, path remapping and retry safety included), then remove the torrent keeping the files. Only acts when the torrent is in a safe, completed state.
+| `move_files` | string | Move the payload to this directory, honoring the server's `after_move` setting (qBittorrent-side relocation that keeps seeding by default, or a host-side move with path remapping and retry safety). Only acts when the torrent is in a safe, completed state.
 | `remove` | — | Remove the torrent from qBittorrent, keeping its files.
 | `remove_with_data` | — | Remove the torrent and let qBittorrent delete its files (honors qBittorrent's trash preference).
 | `delete` | — | Delete the payload via this tool's <<delete-flow,delete flow>> (host-side trash with fallback category).
 | `nothing` | — | Do nothing — shields matching torrents from the default behaviors and later rules.
 |===
 
-`remove`, `remove_with_data`, `delete`, and `move_files` are terminal: the torrent is gone afterwards, so any later actions in the same rule are skipped.
+`remove`, `remove_with_data`, and `delete` are terminal: the torrent is gone afterwards, so any later actions in the same rule are skipped. `move_files` is terminal only with `after_move: remove`; with `keep_seeding` or `stop` the torrent is still in the client and later actions apply normally.
 
 Examples:
 
@@ -335,7 +371,7 @@ categories:
   imported-music: 'G:\media\archive\music'
 ignore_categories: ["tv-sonarr", "radarr", "lidarr"]
 ----
-3. The lifecycle then becomes: *arr grabs the release → qBittorrent downloads it (active category, untouched by this tool) → *arr imports it (hardlink/copy into the library) and re-categorizes the torrent to the post-import category → this tool moves the leftover payload to your archive directory and removes the torrent from qBittorrent.
+3. The lifecycle then becomes: *arr grabs the release → qBittorrent downloads it (active category, untouched by this tool) → *arr imports it (hardlink/copy into the library) and re-categorizes the torrent to the post-import category → this tool moves the leftover payload to your archive directory. With the default `after_move: keep_seeding` the torrent keeps seeding from the archive; set `after_move: remove` if you want it removed from qBittorrent instead.
 
 [WARNING]
 ====
@@ -430,9 +466,13 @@ servers:
     username: ""            # "" = WebUI auth bypass; otherwise FILL IN
     password: ""
     categories:
-      # category: container-side destination directory (under the volumes
-      # mounted above).                             <-- FILL IN
+      # category: destination directory. With the default
+      # after_move: keep_seeding, qBittorrent relocates the payload itself,
+      # so use a path the qBittorrent container can see. With stop/remove
+      # this container moves the files, so use the container-side paths
+      # mounted above.                               <-- FILL IN
       imported-tv: "/data/media/tv"
+    #after_move: keep_seeding   # keep_seeding | stop | remove
     #ignore_categories: ["tv-sonarr", "radarr", "lidarr"]
     # In Docker, prefer letting qBittorrent handle deletion (its trash
     # preference) instead of the container's (nonexistent) trash:
@@ -478,6 +518,9 @@ servers:
   - qbit_url: "http://localhost:8080"
     username: ""               # WebUI auth bypass enabled -> skip login
     password: ""
+    after_move: remove         # this tool moves the files host-side, then
+                               # removes the torrent. See the note below for
+                               # the keep_seeding alternative.
     categories:
       anime: 'G:\media\Anime'  # host path where completed "anime" torrents go
     path_prefix: "/data"           # what the container calls the download root
@@ -493,4 +536,12 @@ Tips:
 
 * `path_prefix` must match the container path exactly, including letter case (`/data`, not `/Data`) — container paths are case-sensitive.
 * Use single-quoted YAML strings for Windows paths (`'G:\data\torrents'`) so backslashes are not treated as escapes.
-* Destination directories (`categories`) are always host paths, since the move is performed by this tool on the host.
+* With `after_move: stop` or `remove`, destination directories (`categories`) are host paths, since the move is performed by this tool on the host.
+
+[NOTE]
+====
+To keep torrents *seeding* after the move in this mixed setup (the default `after_move: keep_seeding`), qBittorrent itself performs the relocation — so the destination must be visible *inside the container*. Two ways to achieve that:
+
+* Put the destination under the download root (e.g. `anime: 'G:\data\torrents\Anime-Archive'`): this tool automatically translates it back to the container view (`/data/Anime-Archive`) before calling `setLocation`.
+* Or mount your media directory into the qBittorrent container (e.g. `G:\media` as `/media`) and use the container path directly: `anime: "/media/Anime"`.
+====

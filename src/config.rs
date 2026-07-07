@@ -139,6 +139,10 @@ pub struct ServerConfig {
     /// remote mount path) to strip before prepending `root_path`.
     #[serde(default)]
     pub path_prefix: Option<String>,
+    /// What happens to the torrent (in qBittorrent) after a category-mapped
+    /// move or a `move_files` rule action. Defaults to `keep_seeding`.
+    #[serde(default)]
+    pub after_move: AfterMove,
     /// Categories this tool must never touch in any way (no re-categorizing,
     /// no tagging, no moves, no deletes). Use this to protect the *active*
     /// download categories of other tools (e.g. `tv-sonarr`, `radarr`,
@@ -156,6 +160,24 @@ pub struct ServerConfig {
     /// are skipped for that torrent on that cycle.
     #[serde(default)]
     pub rules: Vec<Rule>,
+}
+
+/// What happens to the torrent entry in qBittorrent after its payload has
+/// been moved to the destination directory.
+#[derive(Debug, Deserialize, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AfterMove {
+    /// Ask qBittorrent itself to relocate the torrent (`setLocation`), so it
+    /// keeps seeding from the new directory. The torrent stays in the client
+    /// under your control. This is the default.
+    #[default]
+    KeepSeeding,
+    /// Move the payload host-side and leave the (stopped) torrent entry in
+    /// qBittorrent. The entry will report missing files if rechecked.
+    Stop,
+    /// Move the payload host-side and remove the torrent from qBittorrent
+    /// (the moved files are kept). This was the historical behavior.
+    Remove,
 }
 
 /// The built-in default behaviors. Only the behaviors listed here exist;
@@ -373,6 +395,7 @@ impl Default for ServerConfig {
             categories: HashMap::new(),
             root_path: None,
             path_prefix: None,
+            after_move: AfterMove::default(),
             ignore_categories: Vec::new(),
             behaviors: BehaviorConfig::default(),
             rules: Vec::new(),
@@ -458,6 +481,7 @@ servers:
         assert_eq!(config.servers.len(), 1);
         assert_eq!(config.servers[0].username, "");
         assert_eq!(config.servers[0].root_path, None);
+        assert_eq!(config.servers[0].after_move, AfterMove::KeepSeeding);
         assert_eq!(config.rate_limit_delay, 5);
         assert_eq!(config.max_log_file_size, "10M");
         assert_eq!(config.max_concurrent_moves, 2);
@@ -482,6 +506,23 @@ servers:
         assert!(parse_duration("").is_err());
         assert!(parse_duration("abc").is_err());
         assert!(parse_duration("7y").is_err());
+    }
+
+    #[test]
+    fn test_after_move_parsing() {
+        for (value, expected) in [
+            ("keep_seeding", AfterMove::KeepSeeding),
+            ("stop", AfterMove::Stop),
+            ("remove", AfterMove::Remove),
+        ] {
+            let yaml = format!(
+                "servers:\n  - qbit_url: \"http://localhost:8080\"\n    after_move: {value}\n"
+            );
+            let config: Config = serde_yaml_ng::from_str(&yaml).expect("Failed to parse");
+            assert_eq!(config.servers[0].after_move, expected, "{value}");
+        }
+        let bad = "servers:\n  - qbit_url: \"http://x\"\n    after_move: explode\n";
+        assert!(serde_yaml_ng::from_str::<Config>(bad).is_err());
     }
 
     #[test]
