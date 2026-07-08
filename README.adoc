@@ -13,6 +13,7 @@ A qBittorrent companion service that organizes your torrents with state-aware, f
 . <<usage,Usage>>
 . <<default-behaviors,Default Behaviors>>
 . <<rules,Rules>>
+. <<discovery,Configuration Discovery>>
 . <<arr-integration,*arr Suite Integration>>
 . <<ecosystem,Ecosystem Compatibility>>
 . <<docker-packaging,Running in Docker>>
@@ -49,9 +50,9 @@ This makes it a natural companion to pipelines where completed downloads are han
 
 === 📦 Moving & file safety
 
-* Category → directory mappings move completed payloads into your library/archive tree.
+* Category → directory mappings move completed payloads into your library/archive tree — or set a destination to `auto` and it *follows the save path configured inside qBittorrent*, re-read every cycle so changes made in the client always win. See <<discovery,Configuration Discovery>>.
 * Uses the torrent's `content_path`, so renamed torrents are moved correctly.
-* Remaps container/seedbox paths to local paths (`path_prefix` / `root_path`) — and back again for client-side relocations.
+* Remaps container/seedbox paths to local paths (`path_prefix` / `root_path`) — and back again for client-side relocations. Remote path mappings you already maintain in Sonarr/Radarr/Lidarr can be *imported automatically* instead of duplicated.
 * Stop-before-move (5.x `stop` / 4.x `pause`) so file handles are released; rename when possible, copy + delete across filesystems; never overwrites an existing destination.
 * Every flow is *retry-safe*: a cycle interrupted mid-move is finished cleanly on the next one.
 
@@ -63,6 +64,7 @@ This makes it a natural companion to pipelines where completed downloads are han
 === 🤝 Plays well with others
 
 * Purpose-built to complement the *arr suite's *Post-Import Category* flow (Sonarr, Radarr, Lidarr) — see <<arr-integration,*arr Suite Integration>>.
+* *Opt-in configuration discovery*: reuse the directory configuration your ecosystem already has — qBittorrent category save paths (`auto` destinations) and *arr remote path mappings — instead of maintaining it twice. Changes made in the client apps always take precedence. See <<discovery,Configuration Discovery>>.
 * Documented compatibility with the wider ecosystem: unpackerr, Overseerr/Jellyseerr/Ombi, Requestrr, slskd/Nicotine+, Plex/Jellyfin/Emby — see <<ecosystem,Ecosystem Compatibility>>.
 * Supports multiple qBittorrent instances, WebUI auth or auth bypass, and rate-limited polling.
 
@@ -154,6 +156,10 @@ servers:
     password: "adminadmin"
     categories:
       distros: "/path/to/distros/directory"
+      # or follow the save path configured inside qBittorrent for a
+      # category (re-read every cycle; client changes win — see
+      # "Configuration Discovery"):
+      #movies: auto
     # Optional: what happens to the torrent in qBittorrent after its files
     # are moved (categories mappings and move_files rule actions):
     #   keep_seeding (default) - qBittorrent relocates the payload itself
@@ -167,6 +173,18 @@ servers:
     # root_path is prepended in its place. Omit both if paths match.
     #root_path: "/mnt/seedbox"
     #path_prefix: "/downloads"
+
+    # Optional: import remote path mappings you already maintain in your
+    # *arr apps instead of duplicating them here (Sonarr/Radarr use API v3,
+    # Lidarr/Readarr v1 — negotiated automatically). Mappings are verified
+    # against this machine's filesystem and refreshed so changes made in
+    # the *arr app take precedence. See "Configuration Discovery".
+    #arr:
+    #  - name: sonarr
+    #    url: "http://localhost:8989"
+    #    api_key: "YOUR_SONARR_API_KEY"
+    #    #host: gluetun   # only mappings for this download-client host
+    #    #refresh: "60s"  # re-read interval (default 60s)
 
     # Optional: categories this tool must NEVER touch in any way.
     # Protect the *active* download categories of other tools here.
@@ -352,6 +370,92 @@ rules:
       - action: delete
 ----
 
+== [[discovery]]Configuration Discovery
+
+Your ecosystem already knows where everything lives: qBittorrent knows each category's save path, and your *arr apps maintain *remote path mappings* — exactly the "path as the download client reports it" → "path as this machine sees it" table this tool needs in mixed environments (qBittorrent in a Docker container, this tool on the host, both touching the same filesystem). Configuration discovery lets you *reuse* that configuration instead of duplicating it.
+
+Discovery is *strictly opt-in and deliberately narrow*: nothing is detected unless you ask for it, category by category and instance by instance, so a fresh install can never launch into behavior you didn't configure.
+
+=== What can be discovered (and what can't)
+
+Each ecosystem app was assessed for whether importing its configuration is *useful and safe*:
+
+[cols="1,2,3"]
+|===
+|Application |Discovered |Why / why not
+
+|qBittorrent
+|✅ Category save paths, per category via the `auto` keyword
+|The client's own `savePath` for a category is the natural destination for torrents in it. Re-read every cycle.
+
+|Sonarr / Radarr (API v3)
+|✅ Remote path mappings, per instance via the `arr` list
+|Their remote path mappings are precisely the translation table this tool needs; import them instead of duplicating them.
+
+|Lidarr / Readarr (API v1)
+|✅ Remote path mappings (same `arr` list — the API version is negotiated automatically)
+|Same resource, older API version; handled transparently.
+
+|unpackerr
+|❌
+|Configured purely by file/environment; exposes no API to read its paths from.
+
+|Overseerr / Jellyseerr / Ombi / Requestrr
+|❌
+|Request layers with no filesystem paths of their own — there is nothing to detect.
+
+|slskd / Soulseek / Nicotine+
+|❌
+|Separate (non-BitTorrent) download pipelines; their paths never appear in qBittorrent, so importing them could only mislead.
+|===
+
+=== `auto` category destinations
+
+Set a mapped category's destination to `auto` and the destination becomes *whatever save path qBittorrent itself has configured for that category*:
+
+[source,yaml]
+----
+categories:
+  imported-movies: auto        # follow qBittorrent's own save path for this category
+  imported-tv: 'G:\media\tv'   # explicit destinations still work side by side
+----
+
+* The category list is fetched fresh *every polling cycle*, so if you change the category's save path in qBittorrent the new value is used on the very next cycle — *the client's latest change always wins*, no restart or config edit needed.
+* Detection is per category: only categories you explicitly set to `auto` are affected. There is no "import all categories" mode, by design.
+* A detected save path is qBittorrent's *own* view of the filesystem. With the default `after_move: keep_seeding` it is handed straight to `setLocation` (qBittorrent moves the payload itself — path mapping not even required). With `stop`/`remove`, this tool must translate it to its own view first: if no path mapping (explicit or imported) covers it, the torrent is *skipped with a warning* rather than moved into a fabricated local directory.
+* If the category doesn't exist in qBittorrent, has no explicit save path, or the category list can't be fetched, affected torrents are skipped safely that cycle (with a warning explaining why).
+* A real directory literally named `auto` can still be targeted by writing it as a path (`./auto`, `/data/auto`).
+
+=== Importing *arr remote path mappings
+
+List the *arr instances to import from, and their remote path mappings join the translation table alongside your explicit `path_prefix`/`root_path` pair (the longest matching prefix wins):
+
+[source,yaml]
+----
+servers:
+  - qbit_url: "http://localhost:8080"
+    arr:
+      - name: sonarr                     # label used in logs (optional)
+        url: "http://localhost:8989"
+        api_key: "YOUR_SONARR_API_KEY"   # Settings -> General -> API Key
+        #host: gluetun    # only import mappings for this download client host
+        #refresh: "60s"   # how often to re-read the mappings (default 60s)
+      - name: radarr
+        url: "http://localhost:7878"
+        api_key: "YOUR_RADARR_API_KEY"
+----
+
+* Works with Sonarr and Radarr (API v3) and Lidarr and Readarr (API v1) — the version is negotiated automatically, so there is no `kind` field.
+* *Verified before use*: a mapping whose local side does not exist on the machine this tool runs on is skipped (with a warning). A mapping meant for a different machine — or a container-internal path — can never mis-route a move.
+* *Client changes win*: mappings are re-read on the `refresh` interval (default 60s); edit them in the *arr app and this tool follows. If an instance is temporarily unreachable, the last good import keeps serving (and is retried every cycle).
+* The optional `host` filter restricts the import to mappings whose download-client host matches — useful when one *arr instance manages several download clients.
+* Import failures are never fatal: the polling cycle continues with whatever mappings are known.
+
+[NOTE]
+====
+Explicit configuration and discovery compose cleanly: your `path_prefix`/`root_path` pair is simply the first entry of the same translation table, and explicit category destinations coexist with `auto` ones. Where both an imported mapping and the explicit pair could apply, the more specific (longest) prefix wins.
+====
+
 == [[arr-integration]]*arr Suite Integration
 
 This tool is designed to complement the *arr suite's *Post-Import Category* feature. Everything below applies equally to *Sonarr* (TV), *Radarr* (movies), and *Lidarr* (music) — all three are built on the same Servarr download-client framework and offer the same setting.
@@ -483,6 +587,11 @@ servers:
     # differs from THIS container's view (see the volumes above):
     #path_prefix: "/downloads"      # what qBittorrent reports
     #root_path: "/data/torrents"    # where this container sees the same data
+    # Or import the remote path mappings your *arr apps already maintain:
+    #arr:
+    #  - name: sonarr
+    #    url: "http://sonarr:8989"
+    #    api_key: "YOUR_SONARR_API_KEY"
 #rate_limit_delay: 5
 #log_file: "organizarr.log"
 #max_log_file_size: "10M"
@@ -537,6 +646,7 @@ Tips:
 * `path_prefix` must match the container path exactly, including letter case (`/data`, not `/Data`) — container paths are case-sensitive.
 * Use single-quoted YAML strings for Windows paths (`'G:\data\torrents'`) so backslashes are not treated as escapes.
 * With `after_move: stop` or `remove`, destination directories (`categories`) are host paths, since the move is performed by this tool on the host.
+* If your Sonarr/Radarr already have a remote path mapping for this setup (they usually do), you can import it instead of maintaining `path_prefix`/`root_path` by hand — see <<discovery,Configuration Discovery>>. Likewise, `anime: auto` makes the destination follow whatever save path the `anime` category has inside qBittorrent.
 
 [NOTE]
 ====

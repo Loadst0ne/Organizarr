@@ -18,6 +18,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
 mod config;
+mod discovery;
 mod logger;
 mod rules;
 mod torrent;
@@ -34,6 +35,7 @@ use tokio::sync::oneshot::channel as oneshot_channel;
 use tokio::sync::oneshot::Receiver as OneshotReceiver;
 use tokio::time::sleep;
 
+use crate::discovery::DiscoveryCache;
 use crate::torrent::{StateTracker, TorrentClient};
 
 #[tokio::main]
@@ -65,11 +67,18 @@ async fn main() -> Result<()> {
 async fn process_single_server(
     server: ServerConfig,
     tracker: &mut StateTracker,
+    discovery: &mut DiscoveryCache,
     max_concurrent_moves: usize,
     errored_action: ErroredCompletedAction,
 ) -> Result<(), Error> {
-    let torrent_client = TorrentClient::new(server.clone())?;
+    let mut torrent_client = TorrentClient::new(server.clone())?;
     torrent_client.login().await?;
+
+    // Refresh detected configuration (qBittorrent category save paths for
+    // `auto` destinations, imported *arr path mappings) so that the latest
+    // values from the client applications win this cycle.
+    torrent_client.refresh_discovery(discovery).await;
+    let torrent_client = torrent_client;
 
     let torrents = torrent_client.get_torrents().await?;
     // Record every torrent's state and log transitions (e.g. downloading
@@ -142,15 +151,20 @@ async fn process_single_server(
     Ok(())
 }
 
-async fn process_all_servers(config: &Config, trackers: &mut [StateTracker]) -> Result<(), Error> {
+async fn process_all_servers(
+    config: &Config,
+    trackers: &mut [StateTracker],
+    discoveries: &mut [DiscoveryCache],
+) -> Result<(), Error> {
     let tasks = config
         .servers
         .iter()
-        .zip(trackers.iter_mut())
-        .map(|(server, tracker)| {
+        .zip(trackers.iter_mut().zip(discoveries.iter_mut()))
+        .map(|(server, (tracker, discovery))| {
             process_single_server(
                 server.clone(),
                 tracker,
+                discovery,
                 config.max_concurrent_moves,
                 config.errored_completed_action,
             )
@@ -180,8 +194,11 @@ async fn main_loop(config: config::Config, mut shutdown_signal: OneshotReceiver<
     // One state tracker per server, persisted across polling cycles so
     // torrent state transitions can be detected and logged.
     let mut trackers = vec![StateTracker::default(); config.servers.len()];
+    // Discovery caches (imported *arr path mappings) likewise persist so
+    // refresh intervals and stale-reuse work across cycles.
+    let mut discoveries = vec![DiscoveryCache::default(); config.servers.len()];
     loop {
-        if let Err(e) = process_all_servers(&config, &mut trackers).await {
+        if let Err(e) = process_all_servers(&config, &mut trackers, &mut discoveries).await {
             error!("Error processing servers: {:#}", e);
         }
 
@@ -295,6 +312,7 @@ mod tests {
             ..Default::default()
         };
         let mut tracker = StateTracker::default();
+        let mut discovery = DiscoveryCache::default();
 
         // Cycle 1: torrent is downloading; nothing may happen.
         let info_cycle1 = server
@@ -312,6 +330,7 @@ mod tests {
         process_single_server(
             server_config.clone(),
             &mut tracker,
+            &mut discovery,
             2,
             ErroredCompletedAction::Remove,
         )
@@ -353,6 +372,7 @@ mod tests {
         process_single_server(
             server_config.clone(),
             &mut tracker,
+            &mut discovery,
             2,
             ErroredCompletedAction::Remove,
         )
@@ -380,6 +400,7 @@ mod tests {
         process_single_server(
             server_config,
             &mut tracker,
+            &mut discovery,
             2,
             ErroredCompletedAction::Remove,
         )

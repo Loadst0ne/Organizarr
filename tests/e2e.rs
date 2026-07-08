@@ -151,3 +151,129 @@ rate_limit_delay: 1
     stop_mock.assert_async().await;
     delete_mock.assert_async().await;
 }
+
+/// End-to-end discovery workflow, run the way a user would: the real
+/// binary with a config that sets a category destination to `auto` and
+/// imports remote path mappings from a (mock) Sonarr. The daemon must
+/// fetch qBittorrent's category save paths, import and verify the *arr
+/// mapping, and relocate the completed torrent via setLocation to the
+/// save path qBittorrent reports — keeping it seeding (default
+/// after_move), so no host-side move and no removal happen.
+#[tokio::test]
+async fn e2e_auto_destination_with_arr_import() {
+    let mut server = mockito::Server::new_async().await;
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let work = tmp.path();
+
+    // Host-side view of the qBittorrent download area, for the imported
+    // *arr mapping to verify against.
+    let torrents_root = work.join("torrents");
+    fs::create_dir_all(&torrents_root).expect("create torrents root");
+
+    let info_body = serde_json::json!([{
+        "save_path": "/data/Anime",
+        "name": "Some Show S01",
+        "category": "anime",
+        "hash": "autohash",
+        "state": "stalledUP",
+        "content_path": "/data/Anime/Some Show S01",
+        "progress": 1.0,
+        "amount_left": 0,
+        "completion_on": 1_700_000_000
+    }])
+    .to_string();
+    let info_mock = server
+        .mock("GET", "/api/v2/torrents/info")
+        .match_query(mockito::Matcher::Any)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(info_body)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    // qBittorrent's own category configuration: "anime" saves to
+    // /media/anime (the client's view of the filesystem).
+    let categories_mock = server
+        .mock("GET", "/api/v2/torrents/categories")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"anime":{"name":"anime","savePath":"/media/anime"}}"#)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    // The mock Sonarr (same mock server, Sonarr-style path) publishes a
+    // remote path mapping whose local side really exists here.
+    let arr_body = serde_json::json!([{
+        "id": 1,
+        "host": "qbittorrent",
+        "remotePath": "/data",
+        "localPath": yaml_path(&torrents_root)
+    }])
+    .to_string();
+    let arr_mock = server
+        .mock("GET", "/api/v3/remotepathmapping")
+        .match_header("X-Api-Key", "e2e-arr-key")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(arr_body)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    // The relocation must target the save path detected from qBittorrent.
+    let set_location_mock = server
+        .mock("POST", "/api/v2/torrents/setLocation")
+        .match_body(mockito::Matcher::AllOf(vec![
+            mockito::Matcher::UrlEncoded("hashes".into(), "autohash".into()),
+            mockito::Matcher::UrlEncoded("location".into(), "/media/anime".into()),
+        ]))
+        .with_status(200)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    // keep_seeding must never remove the torrent.
+    let delete_mock = server
+        .mock("POST", "/api/v2/torrents/delete")
+        .expect(0)
+        .create_async()
+        .await;
+
+    let config = format!(
+        r#"servers:
+  - qbit_url: "{qbit_url}"
+    username: ""
+    password: ""
+    categories:
+      anime: auto
+    arr:
+      - name: sonarr
+        url: "{arr_url}"
+        api_key: "e2e-arr-key"
+rate_limit_delay: 1
+"#,
+        qbit_url = server.url(),
+        arr_url = server.url(),
+    );
+    fs::write(work.join("config.yaml"), config).expect("write config.yaml");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_organizarr"))
+        .current_dir(work)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn organizarr binary");
+
+    // Wait for the daemon to issue the relocation.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && !set_location_mock.matched_async().await {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    child.kill().ok();
+    child.wait().ok();
+
+    info_mock.assert_async().await;
+    categories_mock.assert_async().await;
+    arr_mock.assert_async().await;
+    set_location_mock.assert_async().await;
+    delete_mock.assert_async().await;
+}

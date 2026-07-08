@@ -26,6 +26,15 @@ use std::time::Duration;
 
 pub const CONFIG_FILE: &str = "config.yaml";
 
+/// True when a category destination is the special `auto` keyword, meaning
+/// "follow the save path qBittorrent itself has configured for this
+/// category" (re-read every cycle, so changes made in qBittorrent always
+/// win). A literal directory named `auto` can still be targeted by writing
+/// it as a path (e.g. `./auto` or `/data/auto`).
+pub fn is_auto_dest(dest: &str) -> bool {
+    dest.eq_ignore_ascii_case("auto")
+}
+
 /// Parses a human-friendly duration string: a number followed by an
 /// optional unit (`s`, `m`, `h`, `d`, `w`). A bare number means seconds.
 /// Examples: `"7d"`, `"12h"`, `"90m"`, `"3600"`, `"1w"`.
@@ -128,7 +137,10 @@ pub struct ServerConfig {
     #[serde(default)]
     pub password: String,
     /// Maps a qBittorrent category to the local directory completed
-    /// torrents in that category should be moved to.
+    /// torrents in that category should be moved to. The special value
+    /// `auto` makes the destination follow the save path configured for
+    /// that category *inside qBittorrent*, re-read every cycle so changes
+    /// made in the client always take precedence.
     #[serde(default)]
     pub categories: HashMap<String, String>,
     /// Local path that replaces `path_prefix` when mapping remote
@@ -143,6 +155,14 @@ pub struct ServerConfig {
     /// move or a `move_files` rule action. Defaults to `keep_seeding`.
     #[serde(default)]
     pub after_move: AfterMove,
+    /// *arr instances (Sonarr, Radarr, Lidarr, Readarr, ...) whose remote
+    /// path mappings should be imported and used for path translation, in
+    /// addition to the explicit `path_prefix`/`root_path` pair. Strictly
+    /// opt-in; imported mappings are verified against the local filesystem
+    /// before use and refreshed periodically so changes made in the *arr
+    /// app take precedence.
+    #[serde(default)]
+    pub arr: Vec<ArrConfig>,
     /// Categories this tool must never touch in any way (no re-categorizing,
     /// no tagging, no moves, no deletes). Use this to protect the *active*
     /// download categories of other tools (e.g. `tv-sonarr`, `radarr`,
@@ -160,6 +180,50 @@ pub struct ServerConfig {
     /// are skipped for that torrent on that cycle.
     #[serde(default)]
     pub rules: Vec<Rule>,
+}
+
+/// One *arr application (Sonarr, Radarr, Lidarr, Readarr, ...) to import
+/// remote path mappings from. The v3 API (Sonarr/Radarr) is tried first
+/// with a fallback to v1 (Lidarr/Readarr), so no `kind` field is needed.
+#[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
+pub struct ArrConfig {
+    /// Optional label used in logs; defaults to the URL.
+    #[serde(default)]
+    pub name: String,
+    /// Base URL of the *arr instance, e.g. `http://localhost:8989`.
+    pub url: String,
+    /// The instance's API key (Settings -> General in every *arr app).
+    pub api_key: String,
+    /// Only import mappings whose download-client `host` field equals
+    /// this value. Useful when the *arr instance manages several download
+    /// clients; omit to import every (verified) mapping.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// How often the mappings are re-fetched, e.g. "60s", "5m". Changes
+    /// made in the *arr app are picked up within this interval and take
+    /// precedence over previously imported values. Default: "60s".
+    #[serde(default = "default_arr_refresh")]
+    pub refresh: String,
+}
+
+impl ArrConfig {
+    /// Label used in log messages.
+    pub fn label(&self) -> &str {
+        if self.name.is_empty() {
+            &self.url
+        } else {
+            &self.name
+        }
+    }
+
+    /// Parsed refresh interval, falling back to the default on bad input.
+    pub fn refresh_interval(&self) -> Duration {
+        parse_duration(&self.refresh).unwrap_or_else(|_| Duration::from_secs(60))
+    }
+}
+
+fn default_arr_refresh() -> String {
+    String::from("60s")
 }
 
 /// What happens to the torrent entry in qBittorrent after its payload has
@@ -396,6 +460,7 @@ impl Default for ServerConfig {
             root_path: None,
             path_prefix: None,
             after_move: AfterMove::default(),
+            arr: Vec::new(),
             ignore_categories: Vec::new(),
             behaviors: BehaviorConfig::default(),
             rules: Vec::new(),
@@ -652,5 +717,76 @@ max_concurrent_moves: 8
             config.errored_completed_action,
             ErroredCompletedAction::Keep
         );
+    }
+
+    #[test]
+    fn test_auto_dest_keyword() {
+        assert!(is_auto_dest("auto"));
+        assert!(is_auto_dest("Auto"));
+        assert!(is_auto_dest("AUTO"));
+        // Paths that merely contain/resemble "auto" are real directories.
+        assert!(!is_auto_dest("./auto"));
+        assert!(!is_auto_dest("/data/auto"));
+        assert!(!is_auto_dest("automatic"));
+        assert!(!is_auto_dest(""));
+    }
+
+    #[test]
+    fn test_arr_config_parsing() {
+        let yaml = r#"
+servers:
+  - qbit_url: "http://localhost:8080"
+    categories:
+      movies: auto
+      tv: "D:/media/tv"
+    arr:
+      - name: sonarr
+        url: "http://localhost:8989"
+        api_key: "abc123"
+        host: gluetun
+        refresh: "5m"
+      - url: "http://localhost:7878"
+        api_key: "def456"
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse");
+        let server = &config.servers[0];
+        assert!(is_auto_dest(&server.categories["movies"]));
+        assert!(!is_auto_dest(&server.categories["tv"]));
+        assert_eq!(server.arr.len(), 2);
+        let sonarr = &server.arr[0];
+        assert_eq!(sonarr.label(), "sonarr");
+        assert_eq!(sonarr.url, "http://localhost:8989");
+        assert_eq!(sonarr.api_key, "abc123");
+        assert_eq!(sonarr.host.as_deref(), Some("gluetun"));
+        assert_eq!(sonarr.refresh_interval(), Duration::from_secs(300));
+        let radarr = &server.arr[1];
+        // Missing name falls back to the URL for logging.
+        assert_eq!(radarr.label(), "http://localhost:7878");
+        assert_eq!(radarr.host, None);
+        // Default refresh is 60s; bad values also fall back safely.
+        assert_eq!(radarr.refresh_interval(), Duration::from_secs(60));
+        let bad_refresh = ArrConfig {
+            refresh: String::from("often"),
+            ..radarr.clone()
+        };
+        assert_eq!(bad_refresh.refresh_interval(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_arr_config_requires_url_and_api_key() {
+        let missing_key = r#"
+servers:
+  - qbit_url: "http://x"
+    arr:
+      - url: "http://localhost:8989"
+"#;
+        assert!(serde_yaml_ng::from_str::<Config>(missing_key).is_err());
+        let missing_url = r#"
+servers:
+  - qbit_url: "http://x"
+    arr:
+      - api_key: "abc"
+"#;
+        assert!(serde_yaml_ng::from_str::<Config>(missing_url).is_err());
     }
 }

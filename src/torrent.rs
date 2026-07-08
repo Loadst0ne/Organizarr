@@ -17,11 +17,13 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
-use super::config::{AfterMove, ErroredCompletedAction, ServerConfig};
+use super::config::{is_auto_dest, AfterMove, ErroredCompletedAction, ServerConfig};
+use crate::discovery::{DiscoveryCache, PathMapping};
 use anyhow::{bail, Context, Result};
 use log::{info, warn};
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -346,6 +348,14 @@ impl Torrent {
 pub struct TorrentClient {
     client: Client,
     server: ServerConfig,
+    /// Path translation table: the explicit `path_prefix`/`root_path` pair
+    /// (if configured) followed by any mappings imported from *arr
+    /// instances. Longest matching prefix wins on lookup.
+    mappings: Vec<PathMapping>,
+    /// Save paths qBittorrent reports for its categories (client view),
+    /// fetched fresh each cycle when any category destination is `auto` so
+    /// changes made inside qBittorrent always take precedence.
+    auto_save_paths: HashMap<String, String>,
 }
 
 impl TorrentClient {
@@ -357,7 +367,46 @@ impl TorrentClient {
             .timeout(HTTP_TIMEOUT)
             .build()
             .context("Failed to build HTTP client")?;
-        Ok(Self { client, server })
+        let mappings = explicit_mapping(&server).into_iter().collect();
+        Ok(Self {
+            client,
+            server,
+            mappings,
+            auto_save_paths: HashMap::new(),
+        })
+    }
+
+    /// Refreshes discovered configuration for this cycle: qBittorrent
+    /// category save paths (when any destination is `auto`) and imported
+    /// *arr path mappings (when any `arr` instance is configured). Both are
+    /// strictly opt-in and re-read so that the latest change made inside
+    /// the client application always wins. Failures are non-fatal: the
+    /// affected torrents are safely skipped this cycle instead.
+    pub async fn refresh_discovery(&mut self, cache: &mut DiscoveryCache) {
+        if self.server.categories.values().any(|d| is_auto_dest(d)) {
+            match self.fetch_categories().await {
+                Ok(categories) => {
+                    self.auto_save_paths = categories
+                        .into_iter()
+                        .filter(|(_, save_path)| !save_path.is_empty())
+                        .collect();
+                }
+                Err(e) => {
+                    self.auto_save_paths.clear();
+                    warn!(
+                        "Could not fetch category save paths from qBittorrent (auto destinations are skipped this cycle): {:#}",
+                        e
+                    );
+                }
+            }
+        }
+        if !self.server.arr.is_empty() {
+            let imported = cache.arr_mappings(&self.client, &self.server.arr).await;
+            self.mappings = explicit_mapping(&self.server)
+                .into_iter()
+                .chain(imported)
+                .collect();
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -493,6 +542,26 @@ impl TorrentClient {
         .await
         .with_context(|| format!("setLocation to {:?} failed", location))?;
         Ok(())
+    }
+
+    /// Fetches qBittorrent's category list with each category's configured
+    /// save path (the client's own view of the filesystem). Categories
+    /// without an explicit save path report an empty string.
+    pub async fn fetch_categories(&self) -> Result<HashMap<String, String>> {
+        #[derive(Deserialize)]
+        struct Category {
+            #[serde(rename = "savePath", default)]
+            save_path: String,
+        }
+        let response = self.get("/api/v2/torrents/categories", &[]).await?;
+        let categories = response
+            .json::<HashMap<String, Category>>()
+            .await
+            .context("Failed to parse category list from qBittorrent")?;
+        Ok(categories
+            .into_iter()
+            .map(|(name, c)| (name, c.save_path))
+            .collect())
     }
 
     /// POSTs `hashes` to the first endpoint that exists, falling back on
@@ -771,27 +840,59 @@ impl TorrentClient {
         Ok(())
     }
 
-    /// Maps the torrent's path on the qBittorrent host to a local path,
-    /// applying the configured `path_prefix` -> `root_path` remapping.
+    /// Maps the torrent's path on the qBittorrent host to a local path
+    /// using the path translation table (the explicit
+    /// `path_prefix`/`root_path` pair plus any imported *arr mappings).
     fn resolve_source_path(&self, torrent: &Torrent) -> Result<PathBuf> {
         let remote_path = match &torrent.content_path {
-            Some(p) if !p.is_empty() => PathBuf::from(p),
-            _ => PathBuf::from(&torrent.save_path).join(&torrent.name),
+            Some(p) if !p.is_empty() => p.clone(),
+            _ => format!(
+                "{}/{}",
+                torrent.save_path.trim_end_matches(['/', '\\']),
+                torrent.name
+            ),
         };
-        let relative_path = match self.server.path_prefix.as_deref() {
-            Some(prefix) if !prefix.is_empty() => remote_path
-                .strip_prefix(prefix)
-                .with_context(|| {
-                    format!(
-                        "Torrent path {:?} does not start with configured path_prefix {:?}",
-                        remote_path, prefix
-                    )
-                })?
-                .to_path_buf(),
-            _ => remote_path,
-        };
+        if let Some(local) = map_remote_to_local(&self.mappings, &remote_path) {
+            return Ok(local);
+        }
+        if self
+            .server
+            .path_prefix
+            .as_deref()
+            .is_some_and(|p| !p.is_empty())
+        {
+            bail!(
+                "Torrent path {:?} does not start with configured path_prefix {:?} (and no imported path mapping matches)",
+                remote_path,
+                self.server.path_prefix.as_deref().unwrap_or("")
+            );
+        }
+        // No translation applies: use the path as-is (same-filesystem
+        // setups), preserving the legacy root_path join behavior.
         let root_path = PathBuf::from(self.server.root_path.as_deref().unwrap_or(""));
-        Ok(root_path.join(relative_path))
+        Ok(root_path.join(remote_path))
+    }
+
+    /// Resolves the destination for a torrent whose category is mapped.
+    /// Explicit paths are host-view destinations; the `auto` keyword
+    /// resolves to the save path qBittorrent itself has configured for the
+    /// category (client view, fetched fresh this cycle). Returns `None`
+    /// when there is nothing safe to do.
+    fn dest_for_category(&self, torrent: &Torrent) -> Option<CategoryDest> {
+        let dest = self.server.categories.get(&torrent.category)?;
+        if !is_auto_dest(dest) {
+            return Some(CategoryDest::Host(PathBuf::from(dest)));
+        }
+        match self.auto_save_paths.get(&torrent.category) {
+            Some(save_path) => Some(CategoryDest::Client(save_path.clone())),
+            None => {
+                warn!(
+                    "Skipping '{}': its category {:?} is set to auto, but qBittorrent reports no save path for it (category missing, no explicit save path configured, or the category list could not be fetched)",
+                    torrent.name, torrent.category
+                );
+                None
+            }
+        }
     }
 
     /// Handles a completed torrent whose category is mapped to a destination
@@ -802,59 +903,77 @@ impl TorrentClient {
     /// Torrents in unmapped categories, or in states where acting on the
     /// payload is unsafe, are left untouched.
     pub async fn move_and_clean_torrent_files(&self, torrent: &Torrent) -> Result<()> {
-        let Some(dest_dir) = self.server.categories.get(&torrent.category) else {
+        if !torrent.eligible_for_move() {
+            if self.server.categories.contains_key(&torrent.category) {
+                info!(
+                    "Skipping '{}': state is {} (waiting for a safe, completed state)",
+                    torrent.name, torrent.state
+                );
+            }
             return Ok(());
-        };
-        self.move_torrent_files_to(torrent, Path::new(dest_dir))
-            .await
+        }
+        match self.dest_for_category(torrent) {
+            None => Ok(()),
+            Some(CategoryDest::Host(dest_dir)) => {
+                self.move_torrent_files_to(torrent, &dest_dir).await
+            }
+            Some(CategoryDest::Client(remote_dest)) => {
+                self.move_to_client_dest(torrent, &remote_dest).await
+            }
+        }
     }
 
     /// Maps a local (host-side) destination directory back to the path
-    /// qBittorrent itself sees, reversing the `path_prefix` -> `root_path`
-    /// remapping. Destinations outside `root_path` are passed through
-    /// unchanged (assumed to already be qBittorrent-visible). Implemented
-    /// with normalized string operations so Windows-style host paths are
-    /// handled identically on every platform.
+    /// qBittorrent itself sees, reversing the path translation table.
+    /// Destinations outside every mapping are passed through unchanged
+    /// (assumed to already be qBittorrent-visible).
     fn resolve_remote_dest(&self, dest_dir: &Path) -> String {
         let dest = dest_dir.to_string_lossy();
-        if let (Some(prefix), Some(root)) = (
-            self.server.path_prefix.as_deref().filter(|p| !p.is_empty()),
-            self.server.root_path.as_deref().filter(|r| !r.is_empty()),
-        ) {
-            let norm_dest = dest.replace('\\', "/");
-            let norm_root = root.replace('\\', "/");
-            let norm_root = norm_root.trim_end_matches('/');
-            let prefix = prefix.trim_end_matches('/');
-            if let Some(rest) = norm_dest.strip_prefix(norm_root) {
-                if rest.is_empty() {
-                    return prefix.to_string();
-                }
-                // Only treat it as inside root_path on a path-component
-                // boundary ("G:/data" must not match "G:/database").
-                if let Some(rel) = rest.strip_prefix('/') {
-                    return format!("{}/{}", prefix, rel.trim_end_matches('/'));
-                }
-            }
-        }
-        dest.into_owned()
+        map_local_to_remote(&self.mappings, &dest).unwrap_or_else(|| dest.into_owned())
     }
 
     /// Asks qBittorrent to relocate the torrent into `dest_dir` and keep
     /// seeding it from there. The destination is translated to
-    /// qBittorrent's view of the filesystem when it lies under `root_path`;
+    /// qBittorrent's view of the filesystem when a path mapping covers it;
     /// already-relocated torrents are a no-op, making the flow retry-safe.
     async fn relocate_via_client(&self, torrent: &Torrent, dest_dir: &Path) -> Result<()> {
         let remote_dest = self.resolve_remote_dest(dest_dir);
-        if paths_equivalent(&torrent.save_path, &remote_dest) {
+        self.relocate_to_remote(torrent, &remote_dest).await
+    }
+
+    /// `setLocation` with idempotency: torrents already living in the
+    /// destination are left alone.
+    async fn relocate_to_remote(&self, torrent: &Torrent, remote_dest: &str) -> Result<()> {
+        if paths_equivalent(&torrent.save_path, remote_dest) {
             // Already living in the destination; nothing to do.
             return Ok(());
         }
-        self.set_location(&torrent.hash, &remote_dest).await?;
+        self.set_location(&torrent.hash, remote_dest).await?;
         info!(
             "Asked qBittorrent to relocate '{}' to {:?}; it keeps seeding from there",
             torrent.name, remote_dest
         );
         Ok(())
+    }
+
+    /// Handles a destination expressed in *qBittorrent's* view of the
+    /// filesystem (an `auto` category save path). With `keep_seeding` it is
+    /// handed to qBittorrent verbatim. Host-side flows (`stop`/`remove`)
+    /// require a path mapping that translates it to this host's view; if
+    /// none does, the torrent is skipped rather than risking a move to a
+    /// fabricated local directory.
+    async fn move_to_client_dest(&self, torrent: &Torrent, remote_dest: &str) -> Result<()> {
+        if self.server.after_move == AfterMove::KeepSeeding {
+            return self.relocate_to_remote(torrent, remote_dest).await;
+        }
+        let Some(local_dest) = map_remote_to_local(&self.mappings, remote_dest) else {
+            warn!(
+                "Skipping '{}': detected destination {:?} is qBittorrent's view of the filesystem and no path mapping translates it to this host (configure path_prefix/root_path or import *arr mappings, or use after_move: keep_seeding)",
+                torrent.name, remote_dest
+            );
+            return Ok(());
+        };
+        self.host_move(torrent, &local_dest).await
     }
 
     /// Moves the torrent's payload into an explicit destination directory,
@@ -875,6 +994,13 @@ impl TorrentClient {
         if self.server.after_move == AfterMove::KeepSeeding {
             return self.relocate_via_client(torrent, dest_dir).await;
         }
+        self.host_move(torrent, dest_dir).await
+    }
+
+    /// The host-side move flow shared by explicit and detected
+    /// destinations: stop the torrent, move the payload off the async
+    /// runtime, then leave (`stop`) or remove (`remove`) the entry.
+    async fn host_move(&self, torrent: &Torrent, dest_dir: &Path) -> Result<()> {
         let src = self.resolve_source_path(torrent)?;
         let dest_dir = dest_dir.to_path_buf();
 
@@ -927,12 +1053,97 @@ impl TorrentClient {
     }
 }
 
+/// A resolved destination for a mapped category: either a host-view path
+/// (explicit configuration) or a client-view path (detected from
+/// qBittorrent via the `auto` keyword).
+#[derive(Debug, Clone, PartialEq)]
+enum CategoryDest {
+    Host(PathBuf),
+    Client(String),
+}
+
+/// The explicit `path_prefix` -> `root_path` pair as a mapping, when
+/// configured. It participates in the same translation table as imported
+/// mappings and, being listed first, wins ties with equally specific ones.
+fn explicit_mapping(server: &ServerConfig) -> Option<PathMapping> {
+    let prefix = server.path_prefix.as_deref().filter(|p| !p.is_empty())?;
+    Some(PathMapping {
+        remote: prefix.to_string(),
+        local: server.root_path.clone().unwrap_or_default(),
+    })
+}
+
+/// Normalizes a path string for prefix comparison: forward slashes only,
+/// no trailing separator.
+fn norm_path(p: &str) -> String {
+    p.replace('\\', "/").trim_end_matches('/').to_string()
+}
+
+/// Strips `prefix` from `path` on a path-component boundary (`/data` must
+/// not match `/database`), both sides already normalized. Returns the
+/// remainder without its leading slash (empty when the paths are equal).
+fn strip_component_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = path.strip_prefix(prefix)?;
+    if rest.is_empty() {
+        Some("")
+    } else {
+        rest.strip_prefix('/')
+    }
+}
+
+/// Translates a client-view (remote) path to this host's view using the
+/// mapping whose remote side is the longest matching prefix. Implemented
+/// with normalized string operations so Windows-style paths are handled
+/// identically on every platform.
+fn map_remote_to_local(mappings: &[PathMapping], remote: &str) -> Option<PathBuf> {
+    let norm_remote = norm_path(remote);
+    let best = mappings
+        .iter()
+        .filter_map(|m| {
+            let prefix = norm_path(&m.remote);
+            strip_component_prefix(&norm_remote, &prefix).map(|rel| (prefix.len(), &m.local, rel))
+        })
+        .max_by_key(|(len, _, _)| *len)?;
+    let (_, local, rel) = best;
+    let local = PathBuf::from(local.trim_end_matches(['/', '\\']));
+    if rel.is_empty() {
+        Some(local)
+    } else {
+        Some(local.join(rel))
+    }
+}
+
+/// Translates a host-view (local) path back to the client's view using the
+/// mapping whose local side is the longest matching prefix.
+fn map_local_to_remote(mappings: &[PathMapping], local: &str) -> Option<String> {
+    let norm_local = norm_path(local);
+    let best = mappings
+        .iter()
+        .filter_map(|m| {
+            let prefix = norm_path(&m.local);
+            if prefix.is_empty() {
+                // An empty local side (no root_path) cannot anchor a
+                // reverse translation.
+                return None;
+            }
+            strip_component_prefix(&norm_local, &prefix).map(|rel| (prefix.len(), &m.remote, rel))
+        })
+        .max_by_key(|(len, _, _)| *len)?;
+    let (_, remote, rel) = best;
+    let remote = remote.replace('\\', "/");
+    let remote = remote.trim_end_matches('/');
+    if rel.is_empty() {
+        Some(remote.to_string())
+    } else {
+        Some(format!("{}/{}", remote, rel))
+    }
+}
+
 /// Compares two paths for equivalence, tolerating mixed separators and
 /// trailing separators (qBittorrent normalizes to forward slashes; the
 /// configuration may use either).
 fn paths_equivalent(a: &str, b: &str) -> bool {
-    let norm = |p: &str| p.replace('\\', "/").trim_end_matches('/').to_string();
-    norm(a) == norm(b)
+    norm_path(a) == norm_path(b)
 }
 
 /// Result of a [`move_path`] call.
@@ -1634,6 +1845,347 @@ mod tests {
         assert!(paths_equivalent("/media/anime", "/media/anime/"));
         assert!(paths_equivalent(r"G:\media\anime", "G:/media/anime"));
         assert!(!paths_equivalent("/media/anime", "/media/tv"));
+    }
+
+    /// The mapping table picks the *longest* matching prefix in both
+    /// directions, matches only on component boundaries, and tolerates
+    /// mixed separators.
+    #[test]
+    fn test_mapping_table_longest_prefix_both_directions() {
+        let mappings = vec![
+            PathMapping {
+                remote: String::from("/data"),
+                local: String::from(r"G:\data\torrents"),
+            },
+            PathMapping {
+                remote: String::from("/data/media"),
+                local: String::from(r"M:\media"),
+            },
+        ];
+        // Forward: the more specific /data/media mapping wins.
+        assert_eq!(
+            map_remote_to_local(&mappings, "/data/media/movies/Film"),
+            Some(PathBuf::from(r"M:\media").join("movies/Film"))
+        );
+        assert_eq!(
+            map_remote_to_local(&mappings, "/data/Anime/show"),
+            Some(PathBuf::from(r"G:\data\torrents").join("Anime/show"))
+        );
+        // Exact match maps to the local root itself.
+        assert_eq!(
+            map_remote_to_local(&mappings, "/data/media/"),
+            Some(PathBuf::from(r"M:\media"))
+        );
+        // Component boundary: /data/mediacenter is NOT under /data/media.
+        assert_eq!(
+            map_remote_to_local(&mappings, "/data/mediacenter/x"),
+            Some(PathBuf::from(r"G:\data\torrents").join("mediacenter/x"))
+        );
+        // No mapping matches.
+        assert_eq!(map_remote_to_local(&mappings, "/other/place"), None);
+
+        // Reverse: longest local prefix wins; output uses client-style
+        // forward slashes.
+        assert_eq!(
+            map_local_to_remote(&mappings, r"M:\media\movies\Film"),
+            Some(String::from("/data/media/movies/Film"))
+        );
+        assert_eq!(
+            map_local_to_remote(&mappings, r"G:\data\torrents\Anime"),
+            Some(String::from("/data/Anime"))
+        );
+        assert_eq!(map_local_to_remote(&mappings, r"C:\elsewhere"), None);
+    }
+
+    /// An `auto` category destination follows the save path qBittorrent
+    /// reports for that category; under `keep_seeding` it is handed to
+    /// setLocation verbatim. A later change inside qBittorrent must win on
+    /// the next refresh (client-side changes take precedence).
+    #[tokio::test]
+    async fn test_auto_destination_follows_client_and_client_changes_win() -> Result<()> {
+        let mut server = Server::new_async().await;
+        let torrent = Torrent {
+            save_path: String::from("/downloads"),
+            name: String::from("some_movie"),
+            category: String::from("movies"),
+            hash: String::from("auto_hash"),
+            state: TorrentState::Uploading,
+            ..Default::default()
+        };
+        let mut server_config = bypass_auth_config(server.url());
+        server_config
+            .categories
+            .insert("movies".to_string(), "auto".to_string());
+        let mut client = TorrentClient::new(server_config)?;
+        let mut cache = DiscoveryCache::default();
+
+        // Cycle 1: qBittorrent says the movies category saves to /media/movies.
+        let cats1 = server
+            .mock("GET", "/api/v2/torrents/categories")
+            .with_status(200)
+            .with_body(r#"{"movies":{"name":"movies","savePath":"/media/movies"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let loc1 = server
+            .mock("POST", "/api/v2/torrents/setLocation")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("hashes".into(), "auto_hash".into()),
+                mockito::Matcher::UrlEncoded("location".into(), "/media/movies".into()),
+            ]))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        client.refresh_discovery(&mut cache).await;
+        client.move_and_clean_torrent_files(&torrent).await?;
+        cats1.assert_async().await;
+        loc1.assert_async().await;
+        cats1.remove_async().await;
+        loc1.remove_async().await;
+
+        // Cycle 2: the user changed the category's save path in qBittorrent;
+        // the new value must be used without any Organizarr config change.
+        let cats2 = server
+            .mock("GET", "/api/v2/torrents/categories")
+            .with_status(200)
+            .with_body(r#"{"movies":{"name":"movies","savePath":"/media/films"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let loc2 = server
+            .mock("POST", "/api/v2/torrents/setLocation")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("hashes".into(), "auto_hash".into()),
+                mockito::Matcher::UrlEncoded("location".into(), "/media/films".into()),
+            ]))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        client.refresh_discovery(&mut cache).await;
+        client.move_and_clean_torrent_files(&torrent).await?;
+        cats2.assert_async().await;
+        loc2.assert_async().await;
+        Ok(())
+    }
+
+    /// An `auto` category unknown to qBittorrent (or with no explicit save
+    /// path) must skip the torrent safely: no move, no relocation, no
+    /// error.
+    #[tokio::test]
+    async fn test_auto_destination_unknown_category_is_skipped() -> Result<()> {
+        let mut server = Server::new_async().await;
+        let cats = server
+            .mock("GET", "/api/v2/torrents/categories")
+            .with_status(200)
+            // "books" exists but follows the default save path (empty).
+            .with_body(r#"{"books":{"name":"books","savePath":""}}"#)
+            .create_async()
+            .await;
+        let no_loc = server
+            .mock("POST", "/api/v2/torrents/setLocation")
+            .expect(0)
+            .create_async()
+            .await;
+        let no_delete = server
+            .mock("POST", "/api/v2/torrents/delete")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let mut server_config = bypass_auth_config(server.url());
+        server_config
+            .categories
+            .insert("books".to_string(), "auto".to_string());
+        server_config
+            .categories
+            .insert("missing".to_string(), "auto".to_string());
+        let mut client = TorrentClient::new(server_config)?;
+        client
+            .refresh_discovery(&mut DiscoveryCache::default())
+            .await;
+
+        for category in ["books", "missing"] {
+            let torrent = Torrent {
+                save_path: String::from("/downloads"),
+                name: String::from("t"),
+                category: category.to_string(),
+                hash: String::from("h"),
+                state: TorrentState::Uploading,
+                ..Default::default()
+            };
+            client.move_and_clean_torrent_files(&torrent).await?;
+        }
+        cats.assert_async().await;
+        no_loc.assert_async().await;
+        no_delete.assert_async().await;
+        Ok(())
+    }
+
+    /// Under a host-side `after_move` (`remove`), an `auto` destination is
+    /// qBittorrent's view of the filesystem: without a path mapping that
+    /// translates it, the torrent must be skipped rather than moved into a
+    /// fabricated local directory.
+    #[tokio::test]
+    async fn test_auto_destination_host_move_requires_mapping() -> Result<()> {
+        let mut server = Server::new_async().await;
+        let _cats = server
+            .mock("GET", "/api/v2/torrents/categories")
+            .with_status(200)
+            .with_body(r#"{"movies":{"name":"movies","savePath":"/media/movies"}}"#)
+            .create_async()
+            .await;
+        let no_stop = server
+            .mock("POST", "/api/v2/torrents/stop")
+            .expect(0)
+            .create_async()
+            .await;
+        let no_delete = server
+            .mock("POST", "/api/v2/torrents/delete")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let mut server_config = bypass_auth_config(server.url());
+        server_config.after_move = AfterMove::Remove;
+        server_config
+            .categories
+            .insert("movies".to_string(), "auto".to_string());
+        let mut client = TorrentClient::new(server_config)?;
+        client
+            .refresh_discovery(&mut DiscoveryCache::default())
+            .await;
+
+        let torrent = Torrent {
+            save_path: String::from("/downloads"),
+            name: String::from("some_movie"),
+            category: String::from("movies"),
+            hash: String::from("h"),
+            state: TorrentState::Uploading,
+            ..Default::default()
+        };
+        client.move_and_clean_torrent_files(&torrent).await?;
+        no_stop.assert_async().await;
+        no_delete.assert_async().await;
+        Ok(())
+    }
+
+    /// With a path mapping in place, an `auto` destination works end to end
+    /// under `after_move: remove`: source and destination are both
+    /// translated from qBittorrent's view to the host's, the payload is
+    /// moved, and the torrent is removed.
+    #[tokio::test]
+    async fn test_auto_destination_host_move_with_mapping() -> Result<()> {
+        let tmp_dir = tempfile::tempdir()?;
+        let root = tmp_dir.path();
+        let src_dir = root.join("downloads");
+        let dest_dir = root.join("media").join("movies");
+        fs::create_dir_all(&src_dir)?;
+        let src_file = src_dir.join("some_movie");
+        fs::File::create(&src_file)?;
+
+        let mut server = Server::new_async().await;
+        let _cats = server
+            .mock("GET", "/api/v2/torrents/categories")
+            .with_status(200)
+            .with_body(r#"{"movies":{"name":"movies","savePath":"/data/media/movies"}}"#)
+            .create_async()
+            .await;
+        let stop_mock = server
+            .mock("POST", "/api/v2/torrents/stop")
+            .with_status(200)
+            .create_async()
+            .await;
+        let delete_mock = server
+            .mock("POST", "/api/v2/torrents/delete")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut server_config = bypass_auth_config(server.url());
+        server_config.after_move = AfterMove::Remove;
+        server_config.path_prefix = Some(String::from("/data"));
+        server_config.root_path = Some(root.to_string_lossy().to_string());
+        server_config
+            .categories
+            .insert("movies".to_string(), "auto".to_string());
+        let mut client = TorrentClient::new(server_config)?;
+        client
+            .refresh_discovery(&mut DiscoveryCache::default())
+            .await;
+
+        let torrent = Torrent {
+            save_path: String::from("/data/downloads"),
+            name: String::from("some_movie"),
+            category: String::from("movies"),
+            hash: String::from("h"),
+            state: TorrentState::StoppedUpload,
+            content_path: Some(String::from("/data/downloads/some_movie")),
+            ..Default::default()
+        };
+        client.move_and_clean_torrent_files(&torrent).await?;
+
+        assert!(!src_file.exists());
+        assert!(dest_dir.join("some_movie").exists());
+        stop_mock.assert_async().await;
+        delete_mock.assert_async().await;
+        Ok(())
+    }
+
+    /// Imported *arr path mappings extend the translation table used for
+    /// source-path resolution, so mixed environments work without
+    /// duplicating the mapping in this tool's own config.
+    #[tokio::test]
+    async fn test_imported_arr_mapping_translates_source_paths() -> Result<()> {
+        let tmp_dir = tempfile::tempdir()?;
+        let local_root = tmp_dir.path().to_string_lossy().to_string();
+
+        let mut server = Server::new_async().await;
+        let body = serde_json::json!([
+            {"id": 1, "host": "qbit", "remotePath": "/data/torrents", "localPath": local_root}
+        ])
+        .to_string();
+        let arr_mock = server
+            .mock("GET", "/api/v3/remotepathmapping")
+            .with_status(200)
+            .with_body(&body)
+            .create_async()
+            .await;
+
+        let mut server_config = bypass_auth_config(server.url());
+        server_config.arr = vec![crate::config::ArrConfig {
+            name: String::from("sonarr"),
+            url: server.url(),
+            api_key: String::from("key"),
+            host: None,
+            refresh: String::from("60s"),
+        }];
+        let mut client = TorrentClient::new(server_config)?;
+        client
+            .refresh_discovery(&mut DiscoveryCache::default())
+            .await;
+        arr_mock.assert_async().await;
+
+        let torrent = Torrent {
+            save_path: String::from("/data/torrents/Anime"),
+            name: String::from("show"),
+            category: String::from("anime"),
+            hash: String::from("h"),
+            content_path: Some(String::from("/data/torrents/Anime/show")),
+            ..Default::default()
+        };
+        assert_eq!(
+            client.resolve_source_path(&torrent)?,
+            PathBuf::from(&local_root).join("Anime/show")
+        );
+        // Reverse translation works off the imported mapping too.
+        assert_eq!(
+            client.resolve_remote_dest(&PathBuf::from(&local_root).join("tv")),
+            "/data/torrents/tv"
+        );
+        Ok(())
     }
 
     #[test]
